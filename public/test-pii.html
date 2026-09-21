@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>PII Test Page — Vision Agent</title>
+<style>
+ body{font-family:system-ui;max-width:780px;margin:24px auto;padding:0 16px;color:#0f172a}
+ .card{border:1px solid #e2e8f0;border-radius:10px;padding:16px;margin:12px 0}
+ label{display:block;font-size:12px;font-weight:600;margin:8px 0 4px}
+ input,textarea{width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px}
+ button{padding:8px 14px;border-radius:8px;border:1px solid #0f172a;background:#0f172a;color:#fff;cursor:pointer}
+ .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+ .face{width:72px;height:72px;border-radius:50%;background:linear-gradient(135deg,#f59e0b,#ec4899);display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:700;margin-right:8px}
+ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;font-size:11px;white-space:pre-wrap}
+ .badge{font-size:10px;background:#fee2e2;color:#991b1b;padding:2px 6px;border-radius:999px}
+</style>
+</head>
+<body>
+<h1>PII Test Page <span class="badge">synthetic data — for evaluation</span></h1>
+<p>This page contains synthetic PII to measure recall/precision of local redaction. Nothing here is real.</p>
+
+<div class="grid">
+<div class="card">
+  <h3>Contact Card — John Doe</h3>
+  <p>Email: john.doe@example.com</p>
+  <p>Phone: +91 98765 43210</p>
+  <p>Aadhaar: 1234 5678 9012</p>
+  <p>PAN: ABCDE1234F</p>
+  <p>Address: 221B Baker Street, Mumbai 400001</p>
+  <div><span class="face">JD</span><span class="face" style="background:linear-gradient(135deg,#06b6d4,#6366f1)">AS</span> faces (simulated persons)</div>
+</div>
+<div class="card">
+  <h3>Payment</h3>
+  <p>Card: 4111 1111 1111 1111 (Visa test, Luhn-valid)</p>
+  <p>SSN: 123-45-6789</p>
+  <p>IP: 192.168.1.42</p>
+  <label>Cardholder</label><input value="John Doe"/>
+  <label>Card Number</label><input autocomplete="cc-number" value="4111 1111 1111 1111"/>
+</div>
+</div>
+
+<div class="card">
+  <h3>Login</h3>
+  <label>Email</label><input type="email" value="john.doe@example.com"/>
+  <label>Password</label><input type="password" value="s3cr3tP@ss!"/>
+  <label>Phone</label><input type="tel" value="+91 98765 43210"/>
+  <button id="submitBtn">Submit</button>
+  <button id="scrollTarget" style="margin-top:60vh">Bottom Target (for scroll test)</button>
+</div>
+
+<div class="card">
+  <h3>Document snippet</h3>
+  <p>Dear Mr. Arjun Sharma, your policy PAN ABCDE1234F has been renewed. Contact arjun.sharma@company.co.in or 99988 77766.</p>
+  <pre id="groundTruth">Ground truth (for evaluator):
+PER: John Doe, Arjun Sharma
+EMAIL: john.doe@example.com, arjun.sharma@company.co.in
+PHONE: +91 98765 43210, 99988 77766
+AADHAAR: 1234 5678 9012
+PAN: ABCDE1234F (x2)
+CC: 4111 1111 1111 1111
+SSN: 123-45-6789
+INPUTS: password, tel, email, cc-number (4 sensitive inputs)
+FACES: 2 simulated</pre>
+</div>
+
+<script>
+ document.getElementById('submitBtn')?.addEventListener('click',()=>alert('Submit clicked — agent action works'));
+</script>
+</body>
+</html>

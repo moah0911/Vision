@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "paths": {
+      "#imports": ["./.wxt/wxt/dir-entrypoints/imports"],
+      "@/*": ["./*"]
+    },
+    "types": ["chrome", "wxt/client"]
+  },
+  "include": ["entrypoints", "modules", "components", ".wxt"]
+}
