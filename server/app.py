@@ -117,19 +117,37 @@ def heuristic_agent(ctx: SanitizedContext) -> AgentResponse:
         )
 
     if "click" in task:
-        # extract target name
         m = re.search(r"click\s+(?:the\s+)?(.+)", task)
-        target_name = (m.group(1) if m else "").strip().strip("'\"")
-        # try exact then fuzzy
-        n = None
-        if target_name:
-            n = find_node(lambda x: target_name.lower() in x.name.lower())
-        if not n:
-            n = find_node(lambda x: x.role in ("button", "link") and len(x.name) > 0)
-        if n:
+        target_name = (m.group(1) if m else "").strip().strip("'\"").lower()
+        # Score candidates: prefer button role/tag, exact name, small bbox (avoids generic 780x818 container)
+        candidates = []
+        for n in nodes:
+            nl = n.name.lower()
+            if target_name and target_name not in nl and nl not in target_name:
+                # For submit, also match if task says submit and node name contains submit
+                if not (target_name and any(w in nl for w in target_name.split())):
+                    continue
+            # Filter to plausible clickable
+            if not target_name and n.role not in ("button", "link") and n.tag not in ("button", "a"):
+                continue
+            candidates.append(n)
+        # If no filtered candidates, consider all containing target
+        if not candidates and target_name:
+            candidates = [n for n in nodes if target_name in n.name.lower() or any(w in n.name.lower() for w in target_name.split())]
+        if not candidates:
+            candidates = [n for n in nodes if n.role in ("button", "link") or n.tag in ("button", "a")]
+        # Sort by: button first, then tag button, then small area, then short name (exact match)
+        def score(n):
+            is_btn = 0 if n.role == "button" else (1 if n.tag == "button" else (2 if n.role == "link" else 3))
+            area = n.bbox[2] * n.bbox[3] if len(n.bbox) >= 4 else 1e9
+            exact = 0 if n.name.lower().strip() == target_name else 1
+            return (is_btn, exact, area, len(n.name))
+        candidates.sort(key=score)
+        if candidates:
+            n = candidates[0]
             return AgentResponse(
-                thought=f"Task asks to click '{target_name}'. Found node '{n.name}' at {n.bbox}. Click via bbox/name.",
-                action=AgentAction(type="click", target={"name": n.name, "bbox": n.bbox, "role": n.role}),
+                thought=f"Task asks to click '{target_name}'. Chose node '{n.name.strip()}' role={n.role} tag={n.tag} area={int(n.bbox[2]*n.bbox[3])} at {n.bbox} (scored {len(candidates)} candidates). Click via name/bbox.",
+                action=AgentAction(type="click", target={"name": n.name.strip(), "bbox": n.bbox, "role": n.role}),
             )
         return AgentResponse(thought="No clickable target found", action=AgentAction(type="say", message="No clickable element matching task"))
 
