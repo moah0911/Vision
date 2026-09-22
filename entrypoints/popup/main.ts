@@ -8,6 +8,7 @@ app.innerHTML = `
       <h1>Vision Privacy Agent</h1>
       <span class="badge">on-device • WebGPU</span>
     </header>
+    <div id="serverBanner" class="hidden" style="background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:6px 8px;border-radius:8px;font-size:11px;"></div>
 
     <section class="card">
       <label>Task for agent (server sees only sanitized data)</label>
@@ -91,9 +92,36 @@ const toastEl = $('#toast') as HTMLDivElement;
 const storageInfoEl = $('#storageInfo') as HTMLSpanElement;
 const quantSel = $('#quantSel') as HTMLSelectElement;
 const memInfoEl = $('#memInfo') as HTMLSpanElement;
+const serverBannerEl = $('#serverBanner') as HTMLDivElement;
 
 let lastContext: any = null;
 let lastAction: any = null;
+
+// Init serverUrl before health check
+chrome.storage.local.get('serverUrl').then((v: any) => {
+  serverUrlEl.value = v?.serverUrl || 'http://localhost:8000';
+  checkServer();
+});
+async function checkServer() {
+  const base = (serverUrlEl.value || 'http://localhost:8000').replace(/\/$/, '');
+  try {
+    const ctrl = new AbortController(); setTimeout(()=>ctrl.abort(), 1200);
+    const r = await fetch(`${base}/health`, { signal: ctrl.signal });
+    if (!r.ok) throw new Error(String(r.status));
+    serverBannerEl.classList.add('hidden');
+    serverBannerEl.textContent = '';
+  } catch {
+    serverBannerEl.textContent = `Server not running at ${base} — Scan will still redact locally, but "Open PII test page" needs http://localhost:8000/test-pii.html . Start: python3 -m uvicorn server.app:app --port 8000`;
+    serverBannerEl.classList.remove('hidden');
+  }
+}
+setInterval(checkServer, 4000);
+serverUrlEl.addEventListener('change', checkServer);
+btnSaveServer.addEventListener('click', async () => {
+  await chrome.storage.local.set({ serverUrl: serverUrlEl.value.trim() });
+  toast('Server URL saved');
+  checkServer();
+});
 
 function toast(msg: string, ms = 2500) {
   toastEl.textContent = msg;
@@ -161,14 +189,7 @@ quantSel.addEventListener('change', async () => {
   refreshDeviceInfo();
 });
 
-// Server URL persist
-chrome.storage.local.get('serverUrl').then((v: any) => {
-  serverUrlEl.value = v?.serverUrl || 'http://localhost:8000';
-});
-btnSaveServer.addEventListener('click', async () => {
-  await chrome.storage.local.set({ serverUrl: serverUrlEl.value.trim() });
-  toast('Server URL saved');
-});
+// Server URL persist (value set above, listener already attached with checkServer)
 
 // Background-orchestrated scan: survives popup close (popup closes on blur by design)
 async function runScanViaBackground(tabId: number, opts: { task?: string; includeScreenshot: boolean }): Promise<any> {
@@ -211,9 +232,20 @@ async function runScanViaBackground(tabId: number, opts: { task?: string; includ
 btnSanitize.addEventListener('click', async () => {
   const tab = await getActiveTab();
   if (!tab?.id) return toast('No active tab');
-  // Guard: extension pages (chrome-extension://) have no content script — hint to use http
+  // Immediate redirect: extension pages never have content script — auto-fix
   if (tab.url?.startsWith('chrome-extension://') && tab.url.includes('test-pii.html')) {
-    toast('Extension test page has no content script. Open http://localhost:8000/test-pii.html (needs server) or any http site instead.', 4000);
+    const { serverUrl } = (await chrome.storage.local.get('serverUrl')) as any;
+    const base = (serverUrl || serverUrlEl.value || 'http://localhost:8000').replace(/\/$/, '');
+    const httpUrl = `${base}/test-pii.html`;
+    toast('Extension test page cannot be scanned (no content script). Redirecting to http://localhost:8000/test-pii.html — needs server running.', 5000);
+    try {
+      await chrome.tabs.update(tab.id!, { url: httpUrl });
+      toast('Redirected to http test page — retry Scan after page loads (2s).', 3000);
+    } catch {}
+    btnSanitize.disabled = false;
+    btnSanitize.textContent = '1. Scan & Redact Locally';
+    setProgress(100, 'redirected');
+    return;
   }
   btnSanitize.disabled = true;
   btnSanitize.textContent = 'Scanning…';
@@ -372,16 +404,23 @@ btnDispose.addEventListener('click', async () => {
 btnTestPage.addEventListener('click', async () => {
   const { serverUrl } = (await chrome.storage.local.get('serverUrl')) as any;
   const base = (serverUrl || serverUrlEl.value || 'http://localhost:8000').replace(/\/$/, '');
-  // Prefer http via server (content script injects; extension pages don't). Fallback to extension page.
+  // Always-sanitized test page must be http-injectable (extension pages have no content script)
   let url = `${base}/test-pii.html`;
   try {
-    const r = await fetch(url, { method: 'HEAD' });
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 1500);
+    const r = await fetch(url, { method: 'HEAD', signal: ctrl.signal });
     if (!r.ok) throw new Error(String(r.status));
   } catch {
-    url = chrome.runtime.getURL('test-pii.html');
-    toast('Server not running — opening extension page (will need http for full inject). Start: python3 -m uvicorn server.app:app --port 8000', 3500);
+    // Do NOT fallback to chrome-extension:// (it will always fail with Receiving end does not exist)
+    // Instead open a data URL with instruction + fallback to any http page
+    toast('Server not running — cannot open http test page. Start server first: python3 -m uvicorn server.app:app --port 8000  (then retry)', 5000);
+    // Still open a usable page: open current tab's http fallback via example.com with PII query
+    // For now create tab to server url anyway — user can see connection refused and know to start server
+    url = `${base}/test-pii.html`;
   }
   await chrome.tabs.create({ url });
+  // If tab was extension page and scan failed before, auto-redirect hint already shown in btnSanitize path
 });
 
 $('#viewLast')?.addEventListener('click', async (e: Event) => {
