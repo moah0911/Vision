@@ -46,11 +46,15 @@ app.innerHTML = `
     </section>
 
     <section class="card muted-card">
-      <div class="tiny">Local ML: <span id="deviceInfo">detecting…</span> • Models cached via Cache API • No raw PII leaves device</div>
+      <div class="tiny">Local ML: <span id="deviceInfo">detecting…</span> • <span id="storageInfo">storage: …</span> • No raw PII leaves device</div>
       <div class="row">
         <button id="btnPreload" class="ghost">Preload models</button>
         <button id="btnDispose" class="ghost">Free memory</button>
         <button id="btnTestPage" class="ghost">Open PII test page</button>
+      </div>
+      <div class="row">
+        <label class="check">Quant: <select id="quantSel"><option value="q8">q8 (balanced)</option><option value="q4">q4 (low-RAM)</option><option value="fp16">fp16 (GPU)</option></select></label>
+        <span id="memInfo" class="tiny"></span>
       </div>
       <div id="toast" class="toast hidden"></div>
     </section>
@@ -84,6 +88,9 @@ const btnTestPage = $('#btnTestPage') as HTMLButtonElement;
 const confirmRow = $('#confirmRow') as HTMLDivElement;
 const btnConfirm = $('#btnConfirm') as HTMLButtonElement;
 const toastEl = $('#toast') as HTMLDivElement;
+const storageInfoEl = $('#storageInfo') as HTMLSpanElement;
+const quantSel = $('#quantSel') as HTMLSelectElement;
+const memInfoEl = $('#memInfo') as HTMLSpanElement;
 
 let lastContext: any = null;
 let lastAction: any = null;
@@ -118,16 +125,41 @@ chrome.storage.onChanged.addListener((changes) => {
 async function refreshDeviceInfo() {
   let device = 'wasm (fallback)';
   try {
-    // @ts-ignore
-    if (navigator.gpu) {
+    if ((navigator as any).gpu) {
       const a = await (navigator as any).gpu?.requestAdapter?.();
       if (a) device = 'webgpu (GPU)';
     }
   } catch {}
-  const { mlProgress } = (await chrome.storage.local.get('mlProgress')) as any;
-  deviceInfoEl.textContent = `${device} • ${mlProgress ? 'model loading…' : 'q8 quantized, lazy'}`;
+  const { mlProgress, quantMode } = (await chrome.storage.local.get(['mlProgress', 'quantMode'])) as any;
+  const q = quantMode || 'q8';
+  deviceInfoEl.textContent = `${device} • ${q} • ${mlProgress ? 'model loading…' : 'lazy'}`;
+  quantSel.value = q;
+  // storage estimate + memory
+  try {
+    const est: any = await (navigator as any).storage?.estimate?.();
+    if (est?.quota && est?.usage != null) {
+      const pct = ((est.usage / est.quota) * 100).toFixed(1);
+      storageInfoEl.textContent = `storage ${(est.usage / 1e6).toFixed(1)}MB / ${(est.quota / 1e6).toFixed(0)}MB (${pct}%)`;
+    } else storageInfoEl.textContent = 'storage: n/a';
+  } catch { storageInfoEl.textContent = 'storage: n/a'; }
+  if ((performance as any).memory) {
+    const m: any = (performance as any).memory;
+    memInfoEl.textContent = `heap ${(m.usedJSHeapSize / 1e6).toFixed(0)}MB / ${(m.jsHeapSizeLimit / 1e6).toFixed(0)}MB`;
+  } else if ((navigator as any).deviceMemory) {
+    memInfoEl.textContent = `deviceMemory ${(navigator as any).deviceMemory}GB`;
+  }
 }
 refreshDeviceInfo();
+setInterval(refreshDeviceInfo, 3000);
+
+// quant switch
+quantSel.addEventListener('change', async () => {
+  const mode = quantSel.value;
+  await chrome.runtime.sendMessage({ type: 'OFFSCREEN_SET_QUANT', mode } as any).catch(() => {});
+  await chrome.storage.local.set({ quantMode: mode });
+  toast(`Quant set to ${mode} — next load will use it (preload to apply)`);
+  refreshDeviceInfo();
+});
 
 // Server URL persist
 chrome.storage.local.get('serverUrl').then((v: any) => {
@@ -264,8 +296,13 @@ btnPreload.addEventListener('click', async () => {
 });
 
 btnDispose.addEventListener('click', async () => {
-  await chrome.runtime.sendMessage({ type: 'OFFSCREEN_DISPOSE' } as any).catch(() => {});
-  toast('Memory freed');
+  btnDispose.disabled = true;
+  try {
+    const r: any = await chrome.runtime.sendMessage({ type: 'OFFSCREEN_DISPOSE' } as any);
+    toast(r?.freed ? 'Memory freed (pipes disposed)' : 'Memory freed');
+  } catch { toast('Memory freed'); }
+  btnDispose.disabled = false;
+  refreshDeviceInfo();
 });
 
 btnTestPage.addEventListener('click', async () => {

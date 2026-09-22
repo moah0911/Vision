@@ -27,13 +27,14 @@ export default defineConfig({
       128: 'icon/128.png',
     },
   },
-  // WASM must be externalized, not bundled into content script
+  // WASM externalized: transformers.js loads ORT wasm from CDN at runtime, not bundled
   vite: () => ({
     build: {
       target: 'esnext',
+      chunkSizeWarningLimit: 1500,
     },
     optimizeDeps: {
-      exclude: ['@huggingface/transformers'],
+      exclude: ['@huggingface/transformers', 'onnxruntime-web'],
     },
     worker: {
       format: 'es',

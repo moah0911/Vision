@@ -156,8 +156,11 @@ def heuristic_agent(ctx: SanitizedContext) -> AgentResponse:
 # ---- Optional VLM path ----
 # Set VLM_BACKEND=hf or openai/gemini to enable. Default: heuristic (zero GPU, deterministic for evaluation).
 
-VLM_BACKEND = os.getenv("VLM_BACKEND", "heuristic")  # heuristic | hf | openai
-HF_MODEL = os.getenv("HF_MODEL", "Qwen/Qwen2-VL-2B-Instruct")  # example open-weights
+VLM_BACKEND = os.getenv("VLM_BACKEND", "heuristic")  # heuristic | hf | openai | gemini
+HF_MODEL = os.getenv("HF_MODEL", "Qwen/Qwen2-VL-2B-Instruct")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 hf_processor = None
 hf_model = None
@@ -172,6 +175,38 @@ def ensure_hf():
     hf_model = AutoModelForVision2Seq.from_pretrained(HF_MODEL, trust_remote_code=True, torch_dtype=torch.float16, device_map="auto")
     hf_model.eval()
 
+async def call_openai(ctx: SanitizedContext) -> AgentResponse:
+    """OpenAI-compatible (OpenAI, Groq, Together) — redaction-aware."""
+    import httpx, json as _json
+    base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    # Build minimal ax_tree text
+    ax_text = "\n".join(f"- {n.role} '{n.name}' {n.bbox} tag={n.tag}" + (f" value={n.value}" if n.value else "") for n in ctx.ax_tree[:30])
+    user_msg = f"Task: {ctx.task or 'summarize'}\nURL: {ctx.url}\nTitle: {ctx.title}\nAX Tree:\n{ax_text}\nRedacted regions: {len(ctx.redacted_regions)}\nRedaction scheme: {ctx.redaction_scheme}\nReturn JSON only: {{\"thought\":\"...\",\"action\":{{\"type\":\"click|fill|scroll|say\",\"target\":{{}},\"value\":\"\"}}}}"
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.post(f"{base}/chat/completions", headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}, json={
+            "model": OPENAI_MODEL, "messages": [{"role":"system","content": SYSTEM_PROMPT},{"role":"user","content": user_msg}], "temperature": 0.2, "max_tokens": 400,
+        })
+        r.raise_for_status()
+        txt = r.json()["choices"][0]["message"]["content"]
+        # Extract JSON
+        m = re.search(r"\{[\s\S]*\}", txt)
+        j = _json.loads(m.group(0) if m else txt)
+        act = j.get("action") or j
+        return AgentResponse(thought=j.get("thought","openai"), action=AgentAction(**act) if isinstance(act, dict) else AgentAction(type="say", message=txt[:300]))
+
+async def call_gemini(ctx: SanitizedContext) -> AgentResponse:
+    import httpx, json as _json
+    ax_text = "\n".join(f"- {n.role} '{n.name}' {n.bbox}" for n in ctx.ax_tree[:30])
+    prompt = SYSTEM_PROMPT + f"\nTask: {ctx.task}\nAX:\n{ax_text}"
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}", json={"contents":[{"parts":[{"text":prompt}]}], "generationConfig":{"temperature":0.2}})
+        r.raise_for_status()
+        txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        m = re.search(r"\{[\s\S]*\}", txt)
+        j = _json.loads(m.group(0) if m else "{}")
+        act = j.get("action") or {"type":"say","message":txt[:300]}
+        return AgentResponse(thought=j.get("thought","gemini"), action=AgentAction(**act))
+
 @app.get("/health")
 def health():
     return {"ok": True, "backend": VLM_BACKEND, "model": HF_MODEL if VLM_BACKEND != "heuristic" else "heuristic"}
@@ -181,30 +216,40 @@ def root():
     return {"name": "Vision Privacy Agent Server", "docs": "/docs", "health": "/health", "redaction_scheme": SYSTEM_PROMPT[:200] + "..."}
 
 @app.post("/api/agent/step", response_model=AgentResponse)
-def agent_step(ctx: SanitizedContext):
+async def agent_step(ctx: SanitizedContext):
     t0 = time.time()
-    # Defensive: ensure no raw PII patterns leaked (server should reject if found)
-    # We check that raw email/phone not present when redacted version should be — warn not block
     raw_leak = None
     joined_names = " ".join(n.name for n in ctx.ax_tree)
     if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", joined_names, re.I):
         raw_leak = "possible raw email in ax_tree — client should have redacted"
-    # Route to backend
-    if VLM_BACKEND == "heuristic":
+    try:
+        if VLM_BACKEND == "heuristic":
+            resp = heuristic_agent(ctx)
+        elif VLM_BACKEND == "hf":
+            ensure_hf()
+            # For 2B model, wire generation if screenshot present else fallback
+            # Quick path: still heuristic + tag so demo runs on CPU
+            resp = heuristic_agent(ctx)
+            resp.thought = "[HF " + HF_MODEL + "] " + resp.thought
+        elif VLM_BACKEND == "openai":
+            if not OPENAI_API_KEY:
+                resp = heuristic_agent(ctx)
+                resp.thought = "[openai-no-key-fallback] " + resp.thought
+            else:
+                resp = await call_openai(ctx)
+        elif VLM_BACKEND == "gemini":
+            if not GEMINI_API_KEY:
+                resp = heuristic_agent(ctx)
+                resp.thought = "[gemini-no-key-fallback] " + resp.thought
+            else:
+                resp = await call_gemini(ctx)
+        else:
+            resp = heuristic_agent(ctx)
+            resp.thought = f"[{VLM_BACKEND}] " + resp.thought
+    except Exception as e:
+        # Fallback never break demo
         resp = heuristic_agent(ctx)
-    elif VLM_BACKEND == "hf":
-        # Placeholder for HF VLM — would encode screenshot + ax_tree text
-        # For submission portability, heuristic is primary; HF path is opt-in.
-        ensure_hf()
-        # ... encode and generate — omitted for lightweight demo, fall back
-        resp = heuristic_agent(ctx)
-        resp.thought = "[HF] " + resp.thought
-    else:
-        # OpenAI/Gemini passthrough — requires API key env
-        resp = heuristic_agent(ctx)
-        resp.thought = f"[{VLM_BACKEND}] " + resp.thought
-
-    # Add latency header via thought suffix for metrics
+        resp.thought = f"[fallback:{type(e).__name__}:{str(e)[:80]}] " + resp.thought
     elapsed = int((time.time() - t0) * 1000)
     resp.thought += f" | server {elapsed}ms | leak_check: {raw_leak or 'ok'}"
     return resp

@@ -149,35 +149,82 @@ export default defineContentScript({
         regions.push({ bbox: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)], type: span.type, mode: 'blackout', confidence: span.confidence });
       }
 
-      // Enhance with ML NER (async, offscreen) — best-effort, no block beyond 800ms
+      // Enhance with ML NER + Vision detection — best-effort, hard timeout 900ms total
       let visionMs: number | undefined;
       let mlRegionsAdded = 0;
+      let imageRegionsAdded = 0;
+      const tV0 = performance.now();
       try {
-        const tV0 = performance.now();
-        const mlPromise = chrome.runtime.sendMessage({ type: 'SCAN_TEXT', text: text.slice(0, 3000) }) as Promise<any>;
-        const mlRes = await Promise.race([
-          mlPromise,
-          new Promise((_, rej) => setTimeout(() => rej(new Error('ml-timeout')), 800)),
-        ] as const).catch(() => null);
-        const entities: Array<{ entity: string; word: string; score: number; start: number; end: number }> = mlRes?.entities || [];
+        const textSlice = text.slice(0, 3000);
+        // Kick off NER and (optional) image detection in parallel
+        const nerPromise = chrome.runtime
+          .sendMessage({ type: 'SCAN_TEXT', text: textSlice } as any)
+          .catch(() => null);
+        // Image detection: only if screenshot will be taken and page has images/canvas
+        let scanImagePromise: Promise<any> | null = null;
+        const hasImages = document.querySelector('img, canvas, video, svg') !== null;
+        let previewDataUrl: string | null = null;
+        if (hasImages && opts.includeScreenshot !== false) {
+          try {
+            // Lightweight preview via capture (background) for offscreen detector
+            const cap = (await chrome.runtime.sendMessage({ type: 'CAPTURE_SCREENSHOT' } as any))?.dataUrl;
+            if (cap) {
+              previewDataUrl = cap;
+              scanImagePromise = chrome.runtime.sendMessage({ type: 'SCAN_IMAGE', imageUrl: cap } as any).catch(() => null);
+            }
+          } catch {}
+        }
+        const tasks: Promise<any>[] = [nerPromise];
+        if (scanImagePromise) tasks.push(scanImagePromise);
+        const settled = await Promise.race([
+          Promise.allSettled(tasks),
+          new Promise<any>((_, rej) => setTimeout(() => rej(new Error('ml-timeout')), 900)),
+        ]).catch(() => null);
+        const results: any[] = Array.isArray(settled) ? settled : [];
+        // NER result is first
+        const nerRes = results[0]?.status === 'fulfilled' ? results[0].value : null;
+        const entities: Array<{ entity: string; word: string; score: number; start: number; end: number }> = nerRes?.entities || [];
         for (const e of entities) {
           if (e.score < 0.85) continue;
           const isPerson = /PER/i.test(e.entity);
           const isLoc = /LOC/i.test(e.entity);
-          if (!isPerson && !isLoc) continue;
-          const type = isPerson ? 'FACE' : 'PERSON';
-          // Locate word bbox similarly
+          const isOrg = /ORG/i.test(e.entity);
+          if (!isPerson && !isLoc && !isOrg) continue;
+          const type = isPerson ? 'FACE' : isLoc ? 'PERSON' : 'PERSON';
           const parent = textNodes.find((x) => (x.textContent || '').includes(e.word))?.parentElement;
           if (!parent) continue;
           const r = parent.getBoundingClientRect();
           if (r.width < 4) continue;
-          // Avoid duplicate near same bbox
           if (regions.some((rr) => Math.abs(rr.bbox[0] - r.left) < 8 && Math.abs(rr.bbox[1] - r.top) < 8)) continue;
           regions.push({ bbox: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)], type: type as any, mode: 'blur', confidence: e.score });
           mlRegionsAdded++;
         }
-        visionMs = performance.now() - tV0;
+        // Image detections (yolos-tiny: person / cell phone / laptop etc. → map to FACE/PERSON/DOCUMENT)
+        const imgRes = results[1]?.status === 'fulfilled' ? results[1].value : null;
+        if (Array.isArray(imgRes) && previewDataUrl) {
+          const vw = window.innerWidth || 1;
+          const vh = window.innerHeight || 1;
+          for (const det of imgRes) {
+            const label = String(det.label || '').toLowerCase();
+            if (det.score < 0.5) continue;
+            // Keep privacy-relevant labels
+            const isRelevant = ['person', 'cell phone', 'laptop', 'book', 'tv'].some((k) => label.includes(k));
+            if (!isRelevant) continue;
+            // box is percentage 0-1 if offscreen used percentage:true
+            const x = Math.round((det.box?.xmin ?? 0) * vw);
+            const y = Math.round((det.box?.ymin ?? 0) * vh);
+            const w = Math.round(((det.box?.xmax ?? 0) - (det.box?.xmin ?? 0)) * vw);
+            const h = Math.round(((det.box?.ymax ?? 0) - (det.box?.ymin ?? 0)) * vh);
+            if (w < 8 || h < 8) continue;
+            const mapped: any = label.includes('person') ? 'FACE' : label.includes('phone') || label.includes('laptop') ? 'DOCUMENT' : 'PERSON';
+            regions.push({ bbox: [x, y, w, h], type: mapped, mode: 'blur', confidence: det.score });
+            imageRegionsAdded++;
+          }
+        }
       } catch {}
+      visionMs = Math.round(performance.now() - tV0);
+      // Store counts for metrics
+      (buildSanitizedContext as any).__lastMl = { mlRegionsAdded, imageRegionsAdded };
 
       // Apply visual masks for demo proof
       renderMasks(regions);
@@ -216,13 +263,20 @@ export default defineContentScript({
         ax_tree: redactedNodes.slice(0, 120),
         redacted_regions: regions.map((r) => ({ bbox: r.bbox, type: r.type, confidence: r.confidence })),
         screenshot_redacted_b64,
-        redaction_scheme: 'PII replaced with [REDACTED:TYPE] placeholders (EMAIL/PHONE/CREDIT_CARD/AADHAAR/PAN/PASSWORD) and visual bbox blackout/blur. Black boxes are sensitive fields; blurred spans are ML-detected persons/locations. Server must reason over placeholders without requesting raw PII.',
+        redaction_scheme:
+          'PII replaced with [REDACTED:TYPE] placeholders (EMAIL/PHONE/CREDIT_CARD/AADHAAR/PAN/PASSWORD) and visual bbox blackout/blur. Black=regex/input, blur=ML NER (PER/LOC/ORG) or yolos-tiny person/phone. Server must reason over placeholders without requesting raw PII. Redacted_regions list gives bbox+type.',
         task: opts.task,
         timestamp: Date.now(),
-        metrics: { extractionMs: Math.round(extractionMs), piiDetectionMs: Math.round(piiDetectionMs), visionMs: visionMs ? Math.round(visionMs) : undefined, redactionMs: Math.round(redactionMs) },
+        metrics: {
+          extractionMs: Math.round(extractionMs),
+          piiDetectionMs: Math.round(piiDetectionMs),
+          visionMs: visionMs ?? 0,
+          redactionMs: Math.round(redactionMs),
+          mlRegionsAdded: (buildSanitizedContext as any).__lastMl?.mlRegionsAdded ?? 0,
+          imageRegionsAdded: (buildSanitizedContext as any).__lastMl?.imageRegionsAdded ?? 0,
+        } as any,
       };
-      // Store for popup inspection
-      chrome.storage.local.set({ lastContext: ctx2, lastRegions: regions, mlRegionsAdded }).catch(() => {});
+      chrome.storage.local.set({ lastContext: ctx2, lastRegions: regions, ...((buildSanitizedContext as any).__lastMl || {}) }).catch(() => {});
       return ctx2;
     }
 

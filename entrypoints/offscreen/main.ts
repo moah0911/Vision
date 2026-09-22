@@ -8,6 +8,16 @@ import { env, pipeline } from '@huggingface/transformers';
 env.allowRemoteModels = true;
 env.allowLocalModels = false;
 env.useBrowserCache = true;
+// Quantization preference: q4 on low-memory, q8 default, fp16 on webgpu
+export type QuantMode = 'q4' | 'q8' | 'fp16' | 'fp32';
+export async function getPreferredDtype(): Promise<QuantMode> {
+  const { quantMode } = (await chrome.storage.local.get('quantMode')) as any;
+  if (quantMode) return quantMode as QuantMode;
+  // Auto: if deviceMemory low, use q4
+  const mem = (navigator as any).deviceMemory;
+  if (mem && mem <= 4) return 'q4';
+  return 'q8';
+}
 
 type ProgressCb = (info: any) => void;
 
@@ -19,21 +29,21 @@ let detLoading = false;
 async function getNER(progress_callback?: ProgressCb) {
   if (nerPipe) return nerPipe;
   if (nerLoading) {
-    // wait for concurrent load
     while (nerLoading) await new Promise((r) => setTimeout(r, 100));
     return nerPipe;
   }
   nerLoading = true;
   try {
     const device = await pickDevice();
-    // DistilBERT NER quantized — <30MB q8, fast
+    const pref = await getPreferredDtype();
+    const dtype = device === 'webgpu' ? 'fp16' : pref === 'q4' ? 'q4' : 'q8';
     nerPipe = await pipeline('token-classification', 'Xenova/distilbert-base-cased-finetuned-conll03-english', {
       // @ts-ignore
       device,
-      dtype: device === 'webgpu' ? 'fp16' : 'q8',
+      dtype,
       progress_callback,
     } as any);
-    console.log('[Offscreen] NER ready', device);
+    console.log('[Offscreen] NER ready', device, dtype);
   } finally {
     nerLoading = false;
   }
@@ -49,13 +59,15 @@ async function getDetector(progress_callback?: ProgressCb) {
   detLoading = true;
   try {
     const device = await pickDevice();
+    const pref = await getPreferredDtype();
+    const dtype = device === 'webgpu' ? 'fp16' : pref === 'q4' ? 'q4' : 'q8';
     detectorPipe = await pipeline('object-detection', 'Xenova/yolos-tiny', {
       // @ts-ignore
       device,
-      dtype: device === 'webgpu' ? 'fp16' : 'q8',
+      dtype,
       progress_callback,
     } as any);
-    console.log('[Offscreen] Detector ready', device);
+    console.log('[Offscreen] Detector ready', device, dtype);
   } finally {
     detLoading = false;
   }
@@ -104,15 +116,34 @@ chrome.runtime.onMessage.addListener((msg: any, _sender, sendResponse) => {
         // out: [{label, score, box:{xmin,ymin,xmax,ymax}}] in 0-1 if percentage true
         sendResponse(Array.isArray(out) ? out : []);
       } else if (msg.type === 'OFFSCREEN_PRELOAD') {
-        // Eager preload for popup button
         await Promise.all([getNER(), getDetector()]);
         sendResponse({ ok: true });
       } else if (msg.type === 'OFFSCREEN_DISPOSE') {
-        if (nerPipe?.dispose) await nerPipe.dispose();
-        if (detectorPipe?.dispose) await detectorPipe.dispose();
+        try {
+          if (nerPipe?.dispose) await nerPipe.dispose();
+          if (detectorPipe?.dispose) await detectorPipe.dispose();
+        } catch {}
         nerPipe = null;
         detectorPipe = null;
-        sendResponse({ ok: true });
+        await chrome.storage.local.remove('mlProgress').catch(() => {});
+        sendResponse({ ok: true, freed: true });
+      } else if (msg.type === 'OFFSCREEN_STORAGE_ESTIMATE') {
+        try {
+          const est: any = await (navigator as any).storage?.estimate?.();
+          sendResponse({ quota: est?.quota, usage: est?.usage, usageDetails: est?.usageDetails });
+        } catch (e: any) {
+          sendResponse({ error: String(e?.message || e) });
+        }
+      } else if (msg.type === 'OFFSCREEN_SET_QUANT') {
+        await chrome.storage.local.set({ quantMode: msg.mode });
+        // dispose so next load uses new quant
+        try {
+          if (nerPipe?.dispose) await nerPipe.dispose();
+          if (detectorPipe?.dispose) await detectorPipe.dispose();
+        } catch {}
+        nerPipe = null;
+        detectorPipe = null;
+        sendResponse({ ok: true, mode: msg.mode });
       }
     } catch (e: any) {
       console.error('[Offscreen] error', e);

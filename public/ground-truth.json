@@ -1,0 +1,21 @@
+{
+  "page": "public/test-pii.html",
+  "description": "Synthetic ground truth for SIH metrics 2/3. Boxes are approximate viewport coords at 1280x800, header visible.",
+  "groundTruth": [
+    { "type": "EMAIL", "value": "john.doe@example.com", "count": 2 },
+    { "type": "EMAIL", "value": "arjun.sharma@company.co.in", "count": 1 },
+    { "type": "PHONE", "value": "+91 98765 43210", "count": 2 },
+    { "type": "PHONE", "value": "99988 77766", "count": 1 },
+    { "type": "AADHAAR", "value": "1234 5678 9012", "count": 1 },
+    { "type": "PAN", "value": "ABCDE1234F", "count": 3 },
+    { "type": "CREDIT_CARD", "value": "4111 1111 1111 1111", "count": 2 },
+    { "type": "SSN", "value": "123-45-6789", "count": 1 },
+    { "type": "IP_ADDRESS", "value": "192.168.1.42", "count": 1 },
+    { "type": "PASSWORD", "value": "password input", "count": 1, "selector": "input[type=password]" },
+    { "type": "FACE", "value": "simulated face 1", "count": 1 },
+    { "type": "FACE", "value": "simulated face 2", "count": 1 }
+  ],
+  "totalSpans": 16,
+  "sensitiveInputs": 4,
+  "notes": "Evaluate via scripts/evaluate.mjs and server POST /api/evaluate/redaction with IoU>=0.5 for bbox precision. Text PII uses regex; NER adds PER/LOC. Person/phone boxes via yolos-tiny on screenshot."
+}

@@ -34,6 +34,7 @@ export default defineBackground(() => {
   browser.runtime.onInstalled.addListener(() => {
     ensureOffscreen();
   });
+  browser.runtime.onStartup?.addListener(() => ensureOffscreen());
   // Also on startup (service worker wake)
   ensureOffscreen();
 
@@ -83,8 +84,19 @@ export default defineBackground(() => {
           const data = await resp.json();
           sendResponse(data);
         } else if (msg.type === 'CAPTURE_SCREENSHOT') {
-          const dataUrl = await browser.tabs.captureVisibleTab({ format: 'jpeg', quality: 70 } as any);
-          sendResponse({ dataUrl });
+          try {
+            const dataUrl = await (browser.tabs as any).captureVisibleTab({ format: 'jpeg', quality: 70 });
+            sendResponse({ dataUrl });
+          } catch (e: any) {
+            // Fallback: no activeTab permission or offscreen context
+            console.warn('[Vision] captureVisibleTab failed', e?.message);
+            sendResponse({ dataUrl: null, error: String(e?.message || e) });
+          }
+        } else if (msg.type === 'OFFSCREEN_SET_QUANT' || msg.type === 'OFFSCREEN_DISPOSE' || msg.type === 'OFFSCREEN_STORAGE_ESTIMATE' || msg.type === 'OFFSCREEN_PRELOAD') {
+          await ensureOffscreen();
+          // proxy to offscreen
+          const res: any = await browser.runtime.sendMessage(msg);
+          sendResponse(res);
         }
       } catch (e: any) {
         console.error('[Vision][BG] handler error', e);
