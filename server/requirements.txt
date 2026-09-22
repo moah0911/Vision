@@ -5,6 +5,7 @@ python-multipart==0.0.9
 httpx==0.27.2
 starlette==0.46.0
 anyio
+python-dotenv
 # Optional local VLM (GPU):
 # torch
 # transformers==4.44.0

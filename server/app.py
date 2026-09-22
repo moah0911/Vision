@@ -156,11 +156,21 @@ def heuristic_agent(ctx: SanitizedContext) -> AgentResponse:
 # ---- Optional VLM path ----
 # Set VLM_BACKEND=hf or openai/gemini to enable. Default: heuristic (zero GPU, deterministic for evaluation).
 
-VLM_BACKEND = os.getenv("VLM_BACKEND", "heuristic")  # heuristic | hf | openai | gemini
+# Load .env if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except: pass
+
+VLM_BACKEND = os.getenv("VLM_BACKEND", "heuristic")  # heuristic | hf | openai | gemini | nvidia
 HF_MODEL = os.getenv("HF_MODEL", "Qwen/Qwen2-VL-2B-Instruct")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Nvidia NIM — OpenAI-compatible, always-sanitized text-only (no vision needed)
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "nvidia/mistral-nemo-minitron-8b-8k-instruct")  # 8B text-only, not 70B — sanitized ax_tree doesn't need vision (70B would be waste for structured click task)
+NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
 hf_processor = None
 hf_model = None
@@ -207,9 +217,63 @@ async def call_gemini(ctx: SanitizedContext) -> AgentResponse:
         act = j.get("action") or {"type":"say","message":txt[:300]}
         return AgentResponse(thought=j.get("thought","gemini"), action=AgentAction(**act))
 
+async def call_nvidia(ctx: SanitizedContext) -> AgentResponse:
+    """Nvidia NIM — text-only, always-sanitized. No vision model needed: ax_tree is already sanitized."""
+    import httpx, json as _json
+    # Always-sanitized: send ax_tree + redaction_scheme + task, ignore screenshot (saves tokens/latency)
+    ax_text = "\n".join(
+        f"- {n.role} '{n.name}' {n.bbox} tag={n.tag}" + (f" value={n.value}" if n.value else "") + (f" isSensitive={n.isSensitive}" if n.isSensitive else "")
+        for n in ctx.ax_tree[:40]
+    )
+    redacted_info = f"Redacted regions: {len(ctx.redacted_regions)} ({', '.join(r.type for r in ctx.redacted_regions[:8])})"
+    user_msg = (
+        f"Task: {ctx.task or 'summarize'}\nURL: {ctx.url}\nTitle: {ctx.title}\n"
+        f"AX Tree (already sanitized, [REDACTED:TYPE] placeholders):\n{ax_text}\n"
+        f"{redacted_info}\nRedaction scheme: {ctx.redaction_scheme}\n"
+        f"Instruction: Return JSON only: {{\"thought\":\"brief reasoning\",\"action\":{{\"type\":\"click|fill|scroll|say\",\"target\":{{\"name\":\"exact name from ax_tree\",\"bbox\":[x,y,w,h],\"role\":\"role\"}},\"value\":\"fill value if fill\",\"direction\":\"up|down\",\"amount\":400,\"message\":\"say text\"}}}}"
+        f" Rules: Use exact name/bbox from ax_tree. Never ask for PII. For fill, requiresConfirmation=true."
+    )
+    async with httpx.AsyncClient(timeout=25) as c:
+        r = await c.post(
+            f"{NVIDIA_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {NVIDIA_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": NVIDIA_MODEL,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT + "\nYou must output valid JSON only. No markdown."},
+                    {"role": "user", "content": user_msg},
+                ],
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "max_tokens": 500,
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        txt = data["choices"][0]["message"]["content"] or ""
+        # Robust JSON extract (handle ```json fences)
+        txt = re.sub(r"```(?:json)?", "", txt).strip()
+        m = re.search(r"\{[\s\S]*\}", txt)
+        j = _json.loads(m.group(0) if m else txt)
+        # Normalize: some models wrap in {thought, action} or just action
+        thought = j.get("thought") or j.get("reasoning") or "nvidia"
+        act = j.get("action") or j
+        # If act is nested weirdly, flatten
+        if isinstance(act, dict) and "action" in act and isinstance(act["action"], dict):
+            act = act["action"]
+        # Validate type
+        if not isinstance(act, dict) or "type" not in act:
+            # Try to infer from task
+            if ctx.task and "click" in ctx.task.lower():
+                act = {"type": "click", "target": {"name": ctx.ax_tree[0].name if ctx.ax_tree else "", "bbox": ctx.ax_tree[0].bbox if ctx.ax_tree else [0,0,10,10]}}
+            else:
+                act = {"type": "say", "message": txt[:400]}
+        return AgentResponse(thought=thought, action=AgentAction(**act), requiresConfirmation=act.get("type")=="fill")
+
 @app.get("/health")
 def health():
-    return {"ok": True, "backend": VLM_BACKEND, "model": HF_MODEL if VLM_BACKEND != "heuristic" else "heuristic"}
+    model = {"heuristic": "heuristic", "hf": HF_MODEL, "openai": OPENAI_MODEL, "gemini": "gemini-1.5-flash", "nvidia": NVIDIA_MODEL}.get(VLM_BACKEND, VLM_BACKEND)
+    return {"ok": True, "backend": VLM_BACKEND, "model": model, "sanitized_only": True, "vision_needed": False}
 
 @app.get("/")
 def root():
@@ -243,6 +307,13 @@ async def agent_step(ctx: SanitizedContext):
                 resp.thought = "[gemini-no-key-fallback] " + resp.thought
             else:
                 resp = await call_gemini(ctx)
+        elif VLM_BACKEND == "nvidia":
+            if not NVIDIA_API_KEY:
+                resp = heuristic_agent(ctx)
+                resp.thought = "[nvidia-no-key-fallback] " + resp.thought
+            else:
+                resp = await call_nvidia(ctx)
+                resp.thought = f"[nvidia:{NVIDIA_MODEL}] {resp.thought}"
         else:
             resp = heuristic_agent(ctx)
             resp.thought = f"[{VLM_BACKEND}] " + resp.thought

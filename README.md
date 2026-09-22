@@ -43,12 +43,16 @@ public/test-pii.html       # synthetic PII corpus for metric 2/3 evaluation
 npm install --ignore-scripts   # onnxruntime-node postinstall needs ignore on CI without CUDA
 npm run dev                # or npm run build && load .output/chrome-mv3
 
-# Server
-pip install fastapi uvicorn starlette anyio pydantic python-multipart httpx
+# Server — always-sanitized text-only (no vision model needed)
+pip install fastapi uvicorn starlette anyio pydantic python-multipart httpx python-dotenv
+# Heuristic (default, 1ms, deterministic — proves sanitized ax_tree suffices):
 python3 -m uvicorn server.app:app --port 8000 --reload
-# VLM mode (needs GPU):
-VLM_BACKEND=hf HF_MODEL=Qwen/Qwen2-VL-2B-Instruct python3 -m uvicorn server.app:app --port 8000
-# or cloud LLM passthrough: VLM_BACKEND=openai (wire your key in app.py)
+# Nvidia NIM 8B text-only (sanitized, not 70B — 70B is overkill for structured click task):
+# .env already has NVIDIA_API_KEY=nvapi-*** ; model 8B text-only because vision already done locally (yolos/ner)
+VLM_BACKEND=nvidia NVIDIA_MODEL=nvidia/mistral-nemo-minitron-8b-8k-instruct python3 -m uvicorn server.app:app --port 8000
+# Vision model only needed if you send screenshot: meta/llama-3.2-11b-vision-instruct (11B) — not needed for ax_tree-only
+# Local HF VLM (needs GPU 8GB): VLM_BACKEND=hf HF_MODEL=Qwen/Qwen2-VL-2B-Instruct python3 -m uvicorn server.app:app --port 8000
+# OpenAI/Gemini passthrough: VLM_BACKEND=openai OPENAI_API_KEY=... or VLM_BACKEND=gemini GEMINI_API_KEY=...
 
 # Health check
 curl http://localhost:8000/health
