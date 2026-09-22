@@ -15,15 +15,24 @@ export default defineContentScript({
   async main(ctx) {
     console.log('[Vision][Content] injected', location.href);
 
-    // Shadow DOM overlay host for privacy visual proof (no layout thrash)
+     // Shadow DOM overlay — use absolute positioning with scroll-aware coordinates (fixes drift on scroll)
     const host = document.createElement('div');
     host.id = 'vision-privacy-overlay-host';
+    // Host covers full page so absolute masks scroll naturally with document
+    Object.assign(host.style, {
+      position: 'absolute',
+      left: '0px',
+      top: '0px',
+      width: '0px',
+      height: '0px',
+      pointerEvents: 'none',
+    } as CSSStyleDeclaration);
     const shadow = host.attachShadow({ mode: 'open' });
     const styleEl = document.createElement('style');
     styleEl.textContent = `
-      .vp-mask { position: fixed; background: #000; border-radius: 4px; pointer-events: none; z-index: 2147483646; }
+      .vp-mask { position: absolute; background: #000; border-radius: 4px; pointer-events: none; z-index: 2147483646; }
       .vp-blur { backdrop-filter: blur(16px); background: rgba(0,0,0,0.45); border: 1px solid rgba(255,0,0,0.6); }
-      .vp-label { position: fixed; font: 10px monospace; color: #fff; background: #b91c1c; padding: 2px 4px; border-radius: 3px; z-index: 2147483647; pointer-events: none; }
+      .vp-label { position: absolute; font: 10px monospace; color: #fff; background: #b91c1c; padding: 2px 4px; border-radius: 3px; z-index: 2147483647; pointer-events: none; white-space: nowrap; }
       .vp-toast { position: fixed; bottom: 16px; right: 16px; background: #111; color: #fff; padding: 10px 14px; border-radius: 8px; font: 13px system-ui; z-index: 2147483647; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
     `;
     shadow.appendChild(styleEl);
@@ -31,24 +40,55 @@ export default defineContentScript({
 
     let activeMasks: HTMLElement[] = [];
     let activeLabels: HTMLElement[] = [];
+    let lastRegions: RedactedRegion[] = [];
+    let scrollRaf: number | null = null;
 
     function clearMasks() {
       for (const el of [...activeMasks, ...activeLabels]) el.remove();
       activeMasks = [];
       activeLabels = [];
+      lastRegions = [];
+      if (scrollRaf) cancelAnimationFrame(scrollRaf);
+      scrollRaf = null;
+      window.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onScroll);
+    }
+
+    function dedupeRegions(regions: RedactedRegion[]): RedactedRegion[] {
+      const out: RedactedRegion[] = [];
+      for (const r of regions) {
+        const dup = out.some(
+          (o) =>
+            o.type === r.type &&
+            Math.abs(o.bbox[0] - r.bbox[0]) < 2 &&
+            Math.abs(o.bbox[1] - r.bbox[1]) < 2 &&
+            Math.abs(o.bbox[2] - r.bbox[2]) < 4 &&
+            Math.abs(o.bbox[3] - r.bbox[3]) < 4,
+        );
+        if (!dup) out.push(r);
+        // Also dedup by IoU ~ identical
+      }
+      return out;
     }
 
     function renderMasks(regions: RedactedRegion[]) {
       clearMasks();
-      for (const r of regions) {
-        const [x, y, w, h] = r.bbox;
+      const filtered = dedupeRegions(regions).filter((r) => r.bbox[2] > 2 && r.bbox[3] > 2);
+      lastRegions = filtered;
+      if (filtered.length === 0) return;
+      // Attach inside shadow with absolute coords = viewport rect + scroll offset (so they scroll with page)
+      for (const r of filtered) {
+        const [vx, vy, w, h] = r.bbox;
+        // Convert viewport coords (from getBoundingClientRect) to document coords
+        const x = Math.round(vx + window.scrollX);
+        const y = Math.round(vy + window.scrollY);
         const m = document.createElement('div');
         m.className = `vp-mask ${r.mode === 'blur' ? 'vp-blur' : ''}`;
         Object.assign(m.style, {
           left: `${x}px`,
           top: `${y}px`,
-          width: `${w}px`,
-          height: `${h}px`,
+          width: `${Math.round(w)}px`,
+          height: `${Math.round(h)}px`,
         } as CSSStyleDeclaration);
         shadow.appendChild(m);
         activeMasks.push(m);
@@ -59,6 +99,22 @@ export default defineContentScript({
         shadow.appendChild(lab);
         activeLabels.push(lab);
       }
+      // Keep masks aligned on scroll/resize without re-extracting (cheap: hide/show would flicker, so we re-render from stored bbox)
+      // For now, since masks are absolute document-coords, they naturally scroll with page — no per-frame update needed.
+      // But if page layout shifts (resize), re-render on resize.
+      window.addEventListener('scroll', onScroll, { passive: true });
+      window.addEventListener('resize', onScroll, { passive: true });
+    }
+
+    function onScroll() {
+      // Masks are absolute document coords, so no reposition needed on scroll — they move with page.
+      // Only handle resize where bbox might change; debounce via rAF and re-render from lastRegions is not enough
+      // since bbox were viewport at scan time. For resize, we just keep masks — user can re-scan via popup.
+      if (scrollRaf) return;
+      scrollRaf = requestAnimationFrame(() => {
+        scrollRaf = null;
+        // No-op for absolute masks; placeholder for future viewport->document recalc if needed
+      });
     }
 
     function isVisible(el: Element): boolean {
@@ -126,11 +182,11 @@ export default defineContentScript({
 
       // Build text->bbox index for overlay: map each regex hit approx via range search
       const regions: RedactedRegion[] = [];
-      // Inputs -> bbox regions (highest priority visual)
+      // Inputs -> bbox regions (highest priority visual) — round sub-pixel to int to avoid server 422
       for (const { el, type } of sensitiveInputs) {
         const r = el.getBoundingClientRect();
         if (r.width < 2) continue;
-        regions.push({ bbox: [r.left, r.top, r.width, r.height], type, mode: 'blackout', confidence: 0.99 });
+        regions.push({ bbox: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)], type, mode: 'blackout', confidence: 0.99 });
       }
       // Text spans -> try to locate via find text nodes (lightweight)
       // For demo we create placeholder regions by scanning text nodes
@@ -223,10 +279,28 @@ export default defineContentScript({
         }
       } catch {}
       visionMs = Math.round(performance.now() - tV0);
-      // Store counts for metrics
-      (buildSanitizedContext as any).__lastMl = { mlRegionsAdded, imageRegionsAdded };
+      // Dedupe before render and before server payload (payload had 22 with exact duplicates EMAIL/PAN x2-3)
+      // dedupe defined inside render scope, but also need standalone here — inline same logic
+      {
+        const seen = new Set<string>();
+        const deduped: typeof regions = [];
+        for (const r of regions) {
+          const key = `${r.type}:${Math.round(r.bbox[0])},${Math.round(r.bbox[1])},${Math.round(r.bbox[2])},${Math.round(r.bbox[3])}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            deduped.push({ ...r, bbox: [Math.round(r.bbox[0]), Math.round(r.bbox[1]), Math.round(r.bbox[2]), Math.round(r.bbox[3])] as any });
+          }
+        }
+        regions.length = 0;
+        regions.push(...deduped);
+      }
+      (buildSanitizedContext as any).__lastMl = {
+        mlRegionsAdded,
+        imageRegionsAdded,
+        totalRegions: regions.length,
+      };
 
-      // Apply visual masks for demo proof
+      // Apply visual masks for demo proof (absolute document coords, survives scroll)
       renderMasks(regions);
 
       // Build redacted ax_tree: replace names containing PII values

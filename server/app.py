@@ -37,7 +37,7 @@ if PUBLIC_DIR.exists():
     def serve_ground_truth():
         return FileResponse(str(PUBLIC_DIR / "ground-truth.json"), media_type="application/json")
 
-# ---- Models ----
+# ---- Models ---- (bbox floats from getBoundingClientRect sub-pixel; accept float, coerce to int on store)
 class Viewport(BaseModel):
     width: int
     height: int
@@ -46,14 +46,14 @@ class AxNode(BaseModel):
     role: str
     name: str
     tag: str
-    bbox: List[int]
+    bbox: List[float]
     value: Optional[str] = None
     inputType: Optional[str] = None
     isSensitive: Optional[bool] = None
     placeholder: Optional[str] = None
 
 class RedactedRegion(BaseModel):
-    bbox: List[int]
+    bbox: List[float]
     type: str
     confidence: float
 
