@@ -2,13 +2,15 @@
 
 > **SIH / Final Year Project** — Privacy-preserving browser agent that runs a local Vision Transformer (via WebGPU/WASM + Transformers.js) to read screen state, dynamically redacts PII (faces/passwords/emails/phones/cards/Aadhaar/PAN), and sends **only sanitized** context to server. Server (FastAPI + VLM/heuristic) returns actionable commands (`click`/`fill`/`scroll`/`say`) that the client executes.
 
-## Demo (2 min flow)
-1. Open `chrome://extensions` → Load unpacked `.output/chrome-mv3` (or `npm run dev`)
-2. Open test page: popup → **Open PII test page** (or `chrome-extension://<id>/test-pii.html`)
-3. Popup: type task `Click Submit` → **1. Scan & Redact Locally** → see black/blur masks over PII + metrics (extraction/pii/vision/redact ms + region count)
-4. Start server: `npm run server:dev` (or `python3 -m uvicorn server.app:app --port 8000`)
-5. Popup: **Ask Agent (sanitized only)** → server replies with `{"thought":...,"action":{"type":"click",...}}` (never sees raw PII)
-6. Popup: **Execute action** → page clicks/scrolls. Check `view lastContext` to prove placeholders `[REDACTED:EMAIL]` not raw values.
+## Demo (2 min flow) — see TESTING.md for full steps
+1. `chrome://extensions` → Developer ON → Load unpacked `.output/chrome-mv3` (or `npm run dev`)
+2. Popup → **Open PII test page** (or `chrome-extension://<id>/test-pii.html`)
+3. Task `Click Submit` → **1. Scan & Redact Locally** → black/blur masks + metrics (extraction/pii/vision/redact ms)
+4. `python3 -m uvicorn server.app:app --port 8000` (or `npm run server:nvidia` with 8B text `nvidia/mistral-nemo-minitron-8b-8k-instruct` — 70B overkill, vision already done locally)
+5. **Ask Agent (sanitized only)** → `{"thought":"... | server 1ms | leak_check: ok","action":{"type":"click",...}}`
+6. **Execute action** → click/scroll. `view lastContext` proves `[REDACTED:EMAIL]` not raw.
+
+Agent tasks real: `click <name>`, `fill "x" in input`, `scroll down/up`, `press Enter`, `summarize page`, multi-step = repeat.
 
 ## Architecture
 ```

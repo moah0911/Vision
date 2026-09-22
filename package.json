@@ -11,8 +11,11 @@
     "zip": "wxt zip",
     "submit": "wxt submit",
     "server:dev": "uvicorn server.app:app --reload --port 8000",
+    "server:nvidia": "VLM_BACKEND=nvidia python -m uvicorn server.app:app --port 8000 --reload",
     "server:install": "pip install -r server/requirements.txt",
-    "test:e2e": "node scripts/e2e-test.mjs"
+    "test:e2e": "node scripts/e2e-test.mjs",
+    "test:agent": "node scripts/test-server.mjs",
+    "eval": "node scripts/evaluate-full.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.7.0",
