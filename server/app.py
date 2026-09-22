@@ -21,6 +21,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Serve test-pii.html and ground-truth via http (so content script injects — extension pages don't match <all_urls>)
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, RedirectResponse
+
+PUBLIC_DIR = Path(__file__).resolve().parent.parent / "public"
+if PUBLIC_DIR.exists():
+    # Mount /static for whole public dir
+    app.mount("/static", StaticFiles(directory=str(PUBLIC_DIR)), name="static")
+    @app.get("/test-pii.html", include_in_schema=False)
+    def serve_test_pii():
+        return FileResponse(str(PUBLIC_DIR / "test-pii.html"), media_type="text/html")
+    @app.get("/ground-truth.json", include_in_schema=False)
+    def serve_ground_truth():
+        return FileResponse(str(PUBLIC_DIR / "ground-truth.json"), media_type="application/json")
+
 # ---- Models ----
 class Viewport(BaseModel):
     width: int

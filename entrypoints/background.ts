@@ -94,9 +94,48 @@ export default defineBackground(() => {
           }
         } else if (msg.type === 'OFFSCREEN_SET_QUANT' || msg.type === 'OFFSCREEN_DISPOSE' || msg.type === 'OFFSCREEN_STORAGE_ESTIMATE' || msg.type === 'OFFSCREEN_PRELOAD') {
           await ensureOffscreen();
-          // proxy to offscreen
           const res: any = await browser.runtime.sendMessage(msg);
           sendResponse(res);
+        } else if (msg.type === 'START_SCAN') {
+          // Background-orchestrated scan: survives popup close (popup closes on blur by design)
+          const tabId = msg.tabId as number;
+          await browser.storage.local.set({ scanState: 'running', scanError: null });
+          try {
+            // Try direct content path; if tab is extension page, inject via scripting as fallback
+            let ctx: any = null;
+            try {
+              ctx = await browser.tabs.sendMessage(tabId, {
+                type: 'GET_SANITIZED_CONTEXT',
+                task: msg.task,
+                includeScreenshot: msg.includeScreenshot,
+              });
+            } catch (e: any) {
+              const err = String(e?.message || e);
+              if (err.includes('Receiving end does not exist')) {
+                // Extension page or not yet injected — try scripting injection
+                try {
+                  await (browser.scripting as any).executeScript({
+                    target: { tabId },
+                    files: ['content-scripts/content.js'],
+                  });
+                  await new Promise((r) => setTimeout(r, 300));
+                  ctx = await browser.tabs.sendMessage(tabId, {
+                    type: 'GET_SANITIZED_CONTEXT',
+                    task: msg.task,
+                    includeScreenshot: msg.includeScreenshot,
+                  });
+                } catch (e2: any) {
+                  throw new Error(`Content not injected. Reload page once after install. For test page use http://localhost:8000/test-pii.html (not chrome-extension://). Details: ${err}`);
+                }
+              } else throw e;
+            }
+            await browser.storage.local.set({ lastContext: ctx, scanState: 'done', scanError: null });
+            sendResponse(ctx);
+          } catch (e: any) {
+            const msg2 = String(e?.message || e);
+            await browser.storage.local.set({ scanState: 'error', scanError: msg2 });
+            sendResponse({ ok: false, error: msg2 });
+          }
         }
       } catch (e: any) {
         console.error('[Vision][BG] handler error', e);

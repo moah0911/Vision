@@ -170,22 +170,85 @@ btnSaveServer.addEventListener('click', async () => {
   toast('Server URL saved');
 });
 
+// Background-orchestrated scan: survives popup close (popup closes on blur by design)
+async function runScanViaBackground(tabId: number, opts: { task?: string; includeScreenshot: boolean }): Promise<any> {
+  const started = Date.now();
+  // Kick off scan in background; background stores progress in chrome.storage.local
+  const bgPromise = chrome.runtime.sendMessage({ type: 'START_SCAN', tabId, ...opts }) as Promise<any>;
+  // Also watch storage for live progress (so popup can close/reopen)
+  // Poll with timeout 8000ms
+  const timeoutMs = 8000;
+  let lastProgress = 8;
+  const poll = new Promise<any>((resolve, reject) => {
+    const start = Date.now();
+    const iv = setInterval(async () => {
+      const { scanState, scanError, lastContext: lc } = (await chrome.storage.local.get(['scanState', 'scanError', 'lastContext'])) as any;
+      if (scanState === 'done' && lc) {
+        clearInterval(iv);
+        resolve(lc);
+      } else if (scanState === 'error') {
+        clearInterval(iv);
+        reject(new Error(scanError || 'Scan failed'));
+      } else if (Date.now() - start > timeoutMs) {
+        clearInterval(iv);
+        reject(new Error('Scan timeout — reload page once after install, and open test page via http://localhost:8000/test-pii.html (extension pages have no content script).'));
+      } else {
+        // bump progress bar while waiting
+        lastProgress = Math.min(85, lastProgress + 2);
+        setProgress(lastProgress, 'redacting…');
+      }
+    }, 200);
+  });
+  // Race background direct response vs polling (whichever comes first)
+  try {
+    const direct = await Promise.race([bgPromise, poll]);
+    // If bgPromise returns context directly, use it
+    if (direct && direct.url) return direct;
+  } catch {}
+  return await poll;
+}
+
 btnSanitize.addEventListener('click', async () => {
   const tab = await getActiveTab();
   if (!tab?.id) return toast('No active tab');
+  // Guard: extension pages (chrome-extension://) have no content script — hint to use http
+  if (tab.url?.startsWith('chrome-extension://') && tab.url.includes('test-pii.html')) {
+    toast('Extension test page has no content script. Open http://localhost:8000/test-pii.html (needs server) or any http site instead.', 4000);
+  }
   btnSanitize.disabled = true;
   btnSanitize.textContent = 'Scanning…';
   setProgress(8, 'extracting DOM');
+  // Clear previous scanState
+  await chrome.storage.local.set({ scanState: 'running', scanError: null }).catch(() => {});
   try {
     const t0 = performance.now();
-    const ctx = await chrome.tabs.sendMessage(tab.id!, {
-      type: 'GET_SANITIZED_CONTEXT',
-      task: taskEl.value.trim() || undefined,
-      includeScreenshot: includeShotEl.checked,
-    });
+    // Try direct content path with timeout, fallback to background orchestrated
+    let ctx: any = null;
+    try {
+      const direct = chrome.tabs.sendMessage(tab.id!, {
+        type: 'GET_SANITIZED_CONTEXT',
+        task: taskEl.value.trim() || undefined,
+        includeScreenshot: includeShotEl.checked,
+      }) as Promise<any>;
+      ctx = await Promise.race([
+        direct,
+        new Promise((_, rej) => setTimeout(() => rej(new Error('direct-timeout')), 3500)),
+      ]);
+    } catch {
+      // Popup would close on blur anyway — use background orchestrated + polling
+      ctx = await runScanViaBackground(tab.id!, {
+        task: taskEl.value.trim() || undefined,
+        includeScreenshot: includeShotEl.checked,
+      });
+    }
+    // Ensure we have ctx (if direct succeeded, poll may already have lastContext)
+    if (!ctx || !ctx.url) {
+      const { lastContext: lc } = (await chrome.storage.local.get('lastContext')) as any;
+      if (lc) ctx = lc;
+    }
+    if (!ctx || !ctx.url) throw new Error('No context returned — reload page once after install, then retry. For test page use http://localhost:8000/test-pii.html');
     const ms = Math.round(performance.now() - t0);
     lastContext = ctx;
-    // metrics
     const m = ctx.metrics || {};
     metricsEl.classList.remove('hidden');
     metricsEl.innerHTML = `
@@ -199,7 +262,7 @@ btnSanitize.addEventListener('click', async () => {
     `;
     previewEl.classList.remove('hidden');
     previewEl.textContent = JSON.stringify(
-      { url: ctx.url, title: ctx.title, ax_tree: ctx.ax_tree.slice(0, 6), redacted_regions: ctx.redacted_regions, hasScreenshot: !!ctx.screenshot_redacted_b64 },
+      { url: ctx.url, title: ctx.title, ax_tree: ctx.ax_tree.slice(0, 6), redacted_regions: ctx.redacted_regions, hasScreenshot: !!ctx.screenshot_redacted_b64, stored: true },
       null,
       2,
     );
@@ -208,9 +271,10 @@ btnSanitize.addEventListener('click', async () => {
     if (!showMasksEl.checked) {
       await chrome.tabs.sendMessage(tab.id!, { type: 'CLEAR_MASKS' }).catch(() => {});
     }
-    toast(`Redacted ${ctx.redacted_regions.length} regions — nothing sent yet`);
+    toast(`Redacted ${ctx.redacted_regions.length} regions — safe to switch window (stored).`);
   } catch (e: any) {
-    toast(`Scan failed: ${e?.message || e}`);
+    setProgress(100, 'failed');
+    toast(`Scan failed: ${e?.message || e}`, 4000);
   } finally {
     btnSanitize.disabled = false;
     btnSanitize.textContent = '1. Scan & Redact Locally';
@@ -306,7 +370,18 @@ btnDispose.addEventListener('click', async () => {
 });
 
 btnTestPage.addEventListener('click', async () => {
-  await chrome.tabs.create({ url: chrome.runtime.getURL('test-pii.html') });
+  const { serverUrl } = (await chrome.storage.local.get('serverUrl')) as any;
+  const base = (serverUrl || serverUrlEl.value || 'http://localhost:8000').replace(/\/$/, '');
+  // Prefer http via server (content script injects; extension pages don't). Fallback to extension page.
+  let url = `${base}/test-pii.html`;
+  try {
+    const r = await fetch(url, { method: 'HEAD' });
+    if (!r.ok) throw new Error(String(r.status));
+  } catch {
+    url = chrome.runtime.getURL('test-pii.html');
+    toast('Server not running — opening extension page (will need http for full inject). Start: python3 -m uvicorn server.app:app --port 8000', 3500);
+  }
+  await chrome.tabs.create({ url });
 });
 
 $('#viewLast')?.addEventListener('click', async (e: Event) => {
@@ -316,15 +391,50 @@ $('#viewLast')?.addEventListener('click', async (e: Event) => {
   agentOut.textContent = JSON.stringify(lc || lastContext || {}, null, 2);
 });
 
+// Restore last scan if popup was closed (popup closes on blur by design — state lives in storage)
+(async () => {
+  const { lastContext: lc, scanState } = (await chrome.storage.local.get(['lastContext', 'scanState'])) as any;
+  if (lc && scanState === 'done') {
+    lastContext = lc;
+    const m = lc.metrics || {};
+    metricsEl.classList.remove('hidden');
+    metricsEl.innerHTML = `
+      <span>extract ${m.extractionMs ?? '-'}ms</span> •
+      <span>pii ${m.piiDetectionMs ?? '-'}ms</span> •
+      <span>vision ${m.visionMs ?? '-'}ms</span> •
+      <span>redact ${m.redactionMs ?? '-'}ms</span> •
+      <span>${lc.redacted_regions?.length ?? 0} regions</span> •
+      <span>${lc.ax_tree?.length ?? 0} nodes</span> • <span class="tiny">restored after popup close</span>
+    `;
+    previewEl.classList.remove('hidden');
+    previewEl.textContent = JSON.stringify({ url: lc.url, title: lc.title, ax_tree: lc.ax_tree?.slice(0, 6), redacted_regions: lc.redacted_regions, hasScreenshot: !!lc.screenshot_redacted_b64 }, null, 2);
+    btnExecute.disabled = false;
+  }
+})();
+
 // Initial ping to content script to check injection
 (async () => {
   const tab = await getActiveTab();
   if (tab?.id) {
+    // Skip ping for extension pages (no content script by design)
+    if (tab.url?.startsWith('chrome-extension://')) {
+      toast('Extension page: open http://localhost:8000/test-pii.html for full test (run server). Popup closes on blur — scan is stored via background.', 3500);
+      return;
+    }
     try {
       await chrome.tabs.sendMessage(tab.id, { type: 'PING' });
     } catch {
-      // auto-inject not yet; show hint
       toast('Reload page once after install to inject content script');
     }
   }
 })();
+
+// Also restore progress if scan running while popup was closed
+chrome.storage.onChanged.addListener((changes) => {
+  if (changes.scanState) {
+    const v = changes.scanState.newValue;
+    if (v === 'running') setProgress(12, 'background scan…');
+    else if (v === 'done') setProgress(100, 'redacted (stored)');
+    else if (v === 'error') setProgress(100, 'failed');
+  }
+});
