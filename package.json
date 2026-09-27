@@ -13,9 +13,10 @@
     "server:dev": "uvicorn server.app:app --reload --port 8000",
     "server:nvidia": "VLM_BACKEND=nvidia python -m uvicorn server.app:app --port 8000 --reload",
     "server:install": "pip install -r server/requirements.txt",
-    "test:e2e": "node scripts/e2e-test.mjs",
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "node --experimental-strip-types scripts/e2e-leak.test.mjs",
     "test:agent": "node scripts/test-server.mjs",
-    "eval": "node scripts/evaluate-full.mjs"
+    "eval": "node --experimental-strip-types scripts/evaluate-full.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.7.0",

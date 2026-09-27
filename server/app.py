@@ -13,12 +13,22 @@ import os
 
 app = FastAPI(title="Vision Privacy Agent Server", version="0.1.0")
 
+# This is a localhost development server. It was mounted with allow_origins=["*"] together with
+# allow_credentials=True, which browsers reject (a credentialed response cannot carry a wildcard
+# origin) and which would expose the agent endpoint to any site in the browser if it ever bound
+# beyond loopback.
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 # Serve test-pii.html and ground-truth via http (so content script injects — extension pages don't match <all_urls>)
@@ -68,6 +78,13 @@ class SanitizedContext(BaseModel):
     task: Optional[str] = None
     timestamp: int
     metrics: Optional[dict] = None
+    # False when the client's on-device NER pass did not finish, so entity names could not be
+    # confirmed stripped from node text. Surfaces in /health and in the step response.
+    pii_text_scan_complete: Optional[bool] = None
+
+    def has_region_type(self, *types: str) -> bool:
+        wanted = {t.upper() for t in types}
+        return any(r.type.upper() in wanted for r in self.redacted_regions)
 
 class AgentAction(BaseModel):
     type: str  # click | fill | scroll | hover | press | wait | done | say
@@ -86,10 +103,12 @@ class AgentResponse(BaseModel):
 
 # ---- Redaction-aware prompt builder ----
 SYSTEM_PROMPT = """You are a browser automation agent. You receive SANITIZED UI context where all PII is already redacted locally:
-- Placeholders like [REDACTED:EMAIL], [REDACTED:PHONE], [REDACTED:PASSWORD], [REDACTED:AADHAAR], [REDACTED:PAN], [REDACTED:CREDIT_CARD] replace sensitive text. You must NOT ask for raw PII.
+- Placeholders like [REDACTED:EMAIL], [REDACTED:PHONE], [REDACTED:CREDIT_CARD], [REDACTED:PERSON_NAME] replace sensitive values. Every form field's value arrives as a placeholder; a field you did not classify is [REDACTED:VALUE]. You must NOT ask for raw PII.
 - Black boxes / blurred regions in screenshot_redacted_b64 are sensitive fields/faces.
+- Node `name` may be [REDACTED:TEXT] when the client's on-device NER pass did not finish. Match elements by `role` and `bbox` in that case, not by name.
 - You MUST reason over structure (ax_tree roles/names/bboxes) and return ONE JSON action.
-- Available actions: click {target:{selector|bbox|name}}, fill {target, value}, scroll {direction:up|down, amount}, press {key}, say {message}, done {message}.
+- Available actions: click {target:{name|bbox|role}}, fill {target, value}, scroll {direction:up|down, amount}, say {message}, done {message}.
+- There is no `press` or `hover`: synthetic key events are not trusted by the page, so they cannot submit or hover reliably.
 - Prefer bbox or name matching over selector if selector missing.
 - Never hallucinate PII. Never request PII.
 - Output strictly: {"thought":"...","action":{"type":"...","target":{...}}}
@@ -164,16 +183,24 @@ def heuristic_agent(ctx: SanitizedContext) -> AgentResponse:
         return AgentResponse(thought="No submit", action=AgentAction(type="say", message="No submit button found"))
 
     if "fill" in task or "type" in task:
-        # Generic fill demo: fill first non-sensitive text input
-        n = find_node(lambda x: x.tag == "input" and not x.isSensitive)
+        # Only fields with no typed value are offered. The client redacts every form value to
+        # a placeholder, so a pre-filled field looks identical to an empty one here and must
+        # not be overwritten with a guess.
+        n = find_node(lambda x: x.tag == "input" and not x.isSensitive and not x.value)
         if n:
             m2 = re.search(r"fill.*?['\"](.+?)['\"]", task)
             val = m2.group(1) if m2 else "demo-value"
             return AgentResponse(
-                thought=f"Fill task -> targeting input '{n.name}'",
+                thought=f"Fill task -> targeting empty input '{n.name}'",
                 action=AgentAction(type="fill", target={"name": n.name, "bbox": n.bbox}, value=val),
                 requiresConfirmation=True,
             )
+        # Previously fell through to the default branch below, so a fill request with no
+        # eligible field silently became a click on the primary button.
+        return AgentResponse(
+            thought="No empty non-sensitive input to fill",
+            action=AgentAction(type="say", message="No empty input field available to fill"),
+        )
 
     if "summarize" in task:
         return AgentResponse(
@@ -304,10 +331,56 @@ async def call_nvidia(ctx: SanitizedContext) -> AgentResponse:
                 act = {"type": "say", "message": txt[:400]}
         return AgentResponse(thought=thought, action=AgentAction(**act), requiresConfirmation=act.get("type")=="fill")
 
+# Leak patterns the client is expected to have neutralised. Checked against BOTH `name` and
+# `value`: the original guard only looked at `name` for email, which is the one field the
+# client was actually leaking (form values are carried in `value`).
+LEAK_PATTERNS: List[tuple[str, "re.Pattern[str]"]] = [
+    ("email", re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)),
+    ("ssn", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
+    ("credit_card", re.compile(r"\b(?:\d[ -]*?){13,19}\b")),
+    ("aadhaar", re.compile(r"\b\d{4}\s?\d{4}\s?\d{4}\b")),
+    ("pan", re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")),
+    ("ip_address", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
+    # A bare 10-15 digit run is a phone number. Credit cards and Aadhaar numbers also match, so
+    # only report this when the field is not already explained by a stronger pattern.
+    ("phone", re.compile(r"\+?\d[\d\s().-]{7,18}\d")),
+]
+
+# A name is not machine-detectable, so this cannot be a regex check. Instead the client
+# reports whether its NER pass completed, and we surface that state rather than assert
+# entity-level completeness we cannot verify from here.
+def scan_for_raw_pii(ctx: SanitizedContext) -> List[str]:
+    findings: List[str] = []
+    for node in ctx.ax_tree:
+        for field in ("name", "value"):
+            text = getattr(node, field, None)
+            if not isinstance(text, str) or not text:
+                continue
+            matched = {label for label, pattern in LEAK_PATTERNS if pattern.search(text)}
+            # A 16-digit card and a 12-digit Aadhaar number both satisfy the broad phone
+            # pattern. Report only the most specific explanation, not all three.
+            if matched & {"credit_card", "aadhaar"}:
+                matched.discard("phone")
+            for label in sorted(matched):
+                findings.append(f"{label} in ax_tree.{field}")
+    if ctx.pii_text_scan_complete is False:
+        findings.append("client NER pass incomplete - entity names unverified")
+    # Deduplicate while preserving order so the message is stable.
+    return list(dict.fromkeys(findings))
+
 @app.get("/health")
 def health():
     model = {"heuristic": "heuristic", "hf": HF_MODEL, "openai": OPENAI_MODEL, "gemini": "gemini-1.5-flash", "nvidia": NVIDIA_MODEL}.get(VLM_BACKEND, VLM_BACKEND)
-    return {"ok": True, "backend": VLM_BACKEND, "model": model, "sanitized_only": True, "vision_needed": False}
+    return {
+        "ok": True,
+        "backend": VLM_BACKEND,
+        "model": model,
+        # The server verifies structured PII is absent, but cannot verify that person names are
+        # gone — that depends on the client's NER pass. Callers should read
+        # pii_text_scan_complete on each context rather than trusting this flag alone.
+        "sanitized_only": "structured-verified",
+        "vision_needed": False,
+    }
 
 @app.get("/")
 def root():
@@ -316,10 +389,7 @@ def root():
 @app.post("/api/agent/step", response_model=AgentResponse)
 async def agent_step(ctx: SanitizedContext):
     t0 = time.time()
-    raw_leak = None
-    joined_names = " ".join(n.name for n in ctx.ax_tree)
-    if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", joined_names, re.I):
-        raw_leak = "possible raw email in ax_tree — client should have redacted"
+    leaks = scan_for_raw_pii(ctx)
     try:
         if VLM_BACKEND == "heuristic":
             resp = heuristic_agent(ctx)
@@ -356,10 +426,17 @@ async def agent_step(ctx: SanitizedContext):
         resp = heuristic_agent(ctx)
         resp.thought = f"[fallback:{type(e).__name__}:{str(e)[:80]}] " + resp.thought
     elapsed = int((time.time() - t0) * 1000)
-    resp.thought += f" | server {elapsed}ms | leak_check: {raw_leak or 'ok'}"
+    if leaks:
+        resp.thought += f" | server {elapsed}ms | LEAK WARNING: {'; '.join(leaks)}"
+    else:
+        resp.thought += f" | server {elapsed}ms | leak_check: ok"
     return resp
 
 # Optional: evaluation helper endpoint
+#
+# Greedy 1:1 matching, mirroring measureRedactionPrecision() in modules/pii/redactor.ts. The
+# previous version let every prediction claim the same ground-truth box, so three predictions
+# over one label counted as three true positives and inflated recall.
 @app.post("/api/evaluate/redaction")
 def evaluate_redaction(predicted: List[RedactedRegion], ground_truth: List[RedactedRegion], iou_thresh: float = 0.5):
     def iou(a, b):
@@ -371,12 +448,34 @@ def evaluate_redaction(predicted: List[RedactedRegion], ground_truth: List[Redac
         inter = w * h
         union = aw * ah + bw * bh - inter
         return inter / union if union else 0
+
     if not predicted and not ground_truth:
-        return {"precision": 1, "recall": 1, "f1": 1}
+        return {"precision": 1, "recall": 1, "f1": 1, "tp": 0, "fp": 0, "fn": 0}
     if not predicted:
-        return {"precision": 0, "recall": 0, "f1": 0}
-    tp = sum(1 for p in predicted if any(g.type == p.type and iou(p, g) >= iou_thresh for g in ground_truth))
-    precision = tp / len(predicted) if predicted else 0
-    recall = tp / len(ground_truth) if ground_truth else 1
+        return {"precision": 0, "recall": 0, "f1": 0, "tp": 0, "fp": 0, "fn": len(ground_truth)}
+    if not ground_truth:
+        return {"precision": 0, "recall": 0, "f1": 0, "tp": 0, "fp": len(predicted), "fn": 0}
+
+    pairs = []
+    for pi, p in enumerate(predicted):
+        for gi, g in enumerate(ground_truth):
+            if g.type.upper() != p.type.upper():
+                continue
+            score = iou(p, g)
+            if score >= iou_thresh:
+                pairs.append((score, pi, gi))
+    pairs.sort(key=lambda t: -t[0])
+
+    used_p, used_g = set(), set()
+    for _score, pi, gi in pairs:
+        if pi in used_p or gi in used_g:
+            continue
+        used_p.add(pi)
+        used_g.add(gi)
+
+    tp = len(used_p)
+    fp, fn = len(predicted) - tp, len(ground_truth) - tp
+    precision = tp / len(predicted)
+    recall = tp / len(ground_truth)
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0
-    return {"precision": precision, "recall": recall, "f1": f1, "tp": tp}
+    return {"precision": precision, "recall": recall, "f1": f1, "tp": tp, "fp": fp, "fn": fn}

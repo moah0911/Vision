@@ -11,8 +11,10 @@ export default defineConfig({
     host_permissions: ['<all_urls>'],
     web_accessible_resources: [
       {
+        // Scoped to the extension's own pages. Exposing wasm/, models/ and offscreen.html to
+        // <all_urls> let any website probe and fetch extension-internal resources by URL.
         resources: ['wasm/*', 'models/*', 'offscreen.html'],
-        matches: ['<all_urls>'],
+        matches: ['chrome-extension://*/*'],
       },
     ],
     // Required for ONNX WASM threading in MV3

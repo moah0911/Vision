@@ -1,4 +1,6 @@
 import './style.css';
+import { DEFAULT_SERVER_URL, normaliseServerUrl, resolveServerUrl } from '../../modules/config';
+import { sendMessage } from '../../modules/messaging/protocol';
 
 const app = document.getElementById('app')!;
 
@@ -99,19 +101,22 @@ let lastAction: any = null;
 
 // Init serverUrl before health check
 chrome.storage.local.get('serverUrl').then((v: any) => {
-  serverUrlEl.value = v?.serverUrl || 'http://localhost:8000';
+  serverUrlEl.value = v?.serverUrl || DEFAULT_SERVER_URL;
   checkServer();
 });
 async function checkServer() {
-  const base = (serverUrlEl.value || 'http://localhost:8000').replace(/\/$/, '');
+  // Prefer what the user typed so an unsaved edit is still probed, then fall back to storage.
+  const base = normaliseServerUrl(serverUrlEl.value || (await resolveServerUrl()));
   try {
-    const ctrl = new AbortController(); setTimeout(()=>ctrl.abort(), 1200);
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 1200);
     const r = await fetch(`${base}/health`, { signal: ctrl.signal });
+    clearTimeout(t);
     if (!r.ok) throw new Error(String(r.status));
     serverBannerEl.classList.add('hidden');
     serverBannerEl.textContent = '';
   } catch {
-    serverBannerEl.textContent = `Server not running at ${base} — Scan will still redact locally, but "Open PII test page" needs http://localhost:8000/test-pii.html . Start: python3 -m uvicorn server.app:app --port 8000`;
+    serverBannerEl.textContent = `Server not running at ${base} — Scan will still redact locally, but "Open PII test page" needs ${base}/test-pii.html . Start: python3 -m uvicorn server.app:app --port 8000`;
     serverBannerEl.classList.remove('hidden');
   }
 }
@@ -183,9 +188,17 @@ setInterval(refreshDeviceInfo, 3000);
 // quant switch
 quantSel.addEventListener('change', async () => {
   const mode = quantSel.value;
-  await chrome.runtime.sendMessage({ type: 'OFFSCREEN_SET_QUANT', mode } as any).catch(() => {});
+  const res = await sendMessage('offscreenSetQuant', { mode }).catch(() => null);
   await chrome.storage.local.set({ quantMode: mode });
-  toast(`Quant set to ${mode} — next load will use it (preload to apply)`);
+  // Report what will actually load, not just what was requested: fp16 has no WASM kernel and
+  // q4/q8 are unavailable on WebGPU, so the requested mode is not always the effective one.
+  const eff = res?.effective;
+  if (eff) {
+    const device = deviceInfoEl.textContent?.includes('webgpu') ? 'webgpu' : 'wasm';
+    toast(`Quant set to ${mode} — loads as ${eff[device]} on ${device}. Preload to apply.`, 4000);
+  } else {
+    toast(`Quant set to ${mode} — next load will use it (preload to apply)`);
+  }
   refreshDeviceInfo();
 });
 
@@ -195,7 +208,7 @@ quantSel.addEventListener('change', async () => {
 async function runScanViaBackground(tabId: number, opts: { task?: string; includeScreenshot: boolean }): Promise<any> {
   const started = Date.now();
   // Kick off scan in background; background stores progress in chrome.storage.local
-  const bgPromise = chrome.runtime.sendMessage({ type: 'START_SCAN', tabId, ...opts }) as Promise<any>;
+  const bgPromise = sendMessage('startScan', { tabId, ...opts });
   // Also watch storage for live progress (so popup can close/reopen)
   // Poll with timeout 8000ms
   const timeoutMs = 8000;
@@ -234,8 +247,7 @@ btnSanitize.addEventListener('click', async () => {
   if (!tab?.id) return toast('No active tab');
   // Immediate redirect: extension pages never have content script — auto-fix
   if (tab.url?.startsWith('chrome-extension://') && tab.url.includes('test-pii.html')) {
-    const { serverUrl } = (await chrome.storage.local.get('serverUrl')) as any;
-    const base = (serverUrl || serverUrlEl.value || 'http://localhost:8000').replace(/\/$/, '');
+    const base = normaliseServerUrl(serverUrlEl.value || (await resolveServerUrl()));
     const httpUrl = `${base}/test-pii.html`;
     toast('Extension test page cannot be scanned (no content script). Redirecting to http://localhost:8000/test-pii.html — needs server running.', 5000);
     try {
@@ -257,11 +269,11 @@ btnSanitize.addEventListener('click', async () => {
     // Try direct content path with timeout, fallback to background orchestrated
     let ctx: any = null;
     try {
-      const direct = chrome.tabs.sendMessage(tab.id!, {
-        type: 'GET_SANITIZED_CONTEXT',
-        task: taskEl.value.trim() || undefined,
-        includeScreenshot: includeShotEl.checked,
-      }) as Promise<any>;
+      const direct = sendMessage(
+        'getSanitizedContext',
+        { task: taskEl.value.trim() || undefined, includeScreenshot: includeShotEl.checked },
+        tab.id!,
+      );
       ctx = await Promise.race([
         direct,
         new Promise((_, rej) => setTimeout(() => rej(new Error('direct-timeout')), 3500)),
@@ -301,7 +313,7 @@ btnSanitize.addEventListener('click', async () => {
     setProgress(100, 'redacted locally');
     latencyEl.textContent = `local ${ms}ms`;
     if (!showMasksEl.checked) {
-      await chrome.tabs.sendMessage(tab.id!, { type: 'CLEAR_MASKS' }).catch(() => {});
+      await sendMessage('clearMasks', undefined, tab.id!).catch(() => {});
     }
     toast(`Redacted ${ctx.redacted_regions.length} regions — safe to switch window (stored).`);
   } catch (e: any) {
@@ -315,7 +327,7 @@ btnSanitize.addEventListener('click', async () => {
 
 btnClear.addEventListener('click', async () => {
   const tab = await getActiveTab();
-  if (tab?.id) await chrome.tabs.sendMessage(tab.id, { type: 'CLEAR_MASKS' }).catch(() => {});
+  if (tab?.id) await sendMessage('clearMasks', undefined, tab.id).catch(() => {});
   previewEl.classList.add('hidden');
   metricsEl.classList.add('hidden');
   toast('Masks cleared');
@@ -329,13 +341,13 @@ btnAgent.addEventListener('click', async () => {
   agentOut.textContent = 'Sending ONLY sanitized context (no raw PII)...';
   try {
     const t0 = performance.now();
-    const serverUrl = (await chrome.storage.local.get('serverUrl') as any)?.serverUrl || serverUrlEl.value.trim() || 'http://localhost:8000';
+    const serverUrl = normaliseServerUrl(serverUrlEl.value || (await resolveServerUrl()));
     // Route via background so only sanitized data hits fetch (background does fetch)
     const tab = await getActiveTab();
     // Prefer background agent step; fallback direct fetch
     let resp: any;
     try {
-      resp = await chrome.runtime.sendMessage({ type: 'AGENT_STEP', context: lastContext });
+      resp = await sendMessage('agentStep', { context: lastContext });
       if (resp?.error) throw new Error(resp.error);
     } catch {
       const r = await fetch(`${serverUrl.replace(/\/$/, '')}/api/agent/step`, {
@@ -367,7 +379,7 @@ btnExecute.addEventListener('click', async () => {
   if (!lastAction) return;
   const tab = await getActiveTab();
   if (!tab?.id) return;
-  const r: any = await chrome.tabs.sendMessage(tab.id, { type: 'EXECUTE_ACTION', action: lastAction });
+  const r = await sendMessage('executeAction', { action: lastAction }, tab.id);
   toast(r?.ok ? `Executed ${lastAction.type}` : `Failed: ${r?.error}`);
 });
 
@@ -380,9 +392,10 @@ btnPreload.addEventListener('click', async () => {
   btnPreload.disabled = true;
   toast('Preloading models… ~30-60MB first time');
   try {
-    await chrome.runtime.sendMessage({ type: 'OFFSCREEN_PRELOAD' } as any).catch(() => chrome.runtime.sendMessage({ type: 'ENSURE_OFFSCREEN' }));
-    // Also trigger offscreen directly
-    await chrome.runtime.sendMessage({ type: 'OFFSCREEN_PRELOAD' });
+    // The background ensures the offscreen document exists before forwarding, so one call is
+    // enough. This used to fire the same request twice, loading both models concurrently.
+    const r = await sendMessage('offscreenPreload', undefined);
+    if (r?.error) throw new Error(r.error);
     toast('Models ready');
   } catch (e: any) {
     toast(`Preload: ${e?.message || 'check console'}`);
@@ -394,7 +407,7 @@ btnPreload.addEventListener('click', async () => {
 btnDispose.addEventListener('click', async () => {
   btnDispose.disabled = true;
   try {
-    const r: any = await chrome.runtime.sendMessage({ type: 'OFFSCREEN_DISPOSE' } as any);
+    const r = await sendMessage('offscreenDispose', undefined);
     toast(r?.freed ? 'Memory freed (pipes disposed)' : 'Memory freed');
   } catch { toast('Memory freed'); }
   btnDispose.disabled = false;
@@ -402,25 +415,22 @@ btnDispose.addEventListener('click', async () => {
 });
 
 btnTestPage.addEventListener('click', async () => {
-  const { serverUrl } = (await chrome.storage.local.get('serverUrl')) as any;
-  const base = (serverUrl || serverUrlEl.value || 'http://localhost:8000').replace(/\/$/, '');
-  // Always-sanitized test page must be http-injectable (extension pages have no content script)
-  let url = `${base}/test-pii.html`;
+  const base = normaliseServerUrl(serverUrlEl.value || (await resolveServerUrl()));
+  // The test page must be served over http: a chrome-extension:// page has no content script,
+  // so nothing can ever be injected into it.
+  const url = `${base}/test-pii.html`;
   try {
     const ctrl = new AbortController();
-    setTimeout(() => ctrl.abort(), 1500);
+    const t = setTimeout(() => ctrl.abort(), 1500);
     const r = await fetch(url, { method: 'HEAD', signal: ctrl.signal });
+    clearTimeout(t);
     if (!r.ok) throw new Error(String(r.status));
   } catch {
-    // Do NOT fallback to chrome-extension:// (it will always fail with Receiving end does not exist)
-    // Instead open a data URL with instruction + fallback to any http page
-    toast('Server not running — cannot open http test page. Start server first: python3 -m uvicorn server.app:app --port 8000  (then retry)', 5000);
-    // Still open a usable page: open current tab's http fallback via example.com with PII query
-    // For now create tab to server url anyway — user can see connection refused and know to start server
-    url = `${base}/test-pii.html`;
+    // Opening the URL anyway just produces a connection-refused page, so stop here.
+    toast(`Server not running — cannot open the test page at ${url}. Start it: python3 -m uvicorn server.app:app --port 8000`, 5000);
+    return;
   }
   await chrome.tabs.create({ url });
-  // If tab was extension page and scan failed before, auto-redirect hint already shown in btnSanitize path
 });
 
 $('#viewLast')?.addEventListener('click', async (e: Event) => {
@@ -447,7 +457,10 @@ $('#viewLast')?.addEventListener('click', async (e: Event) => {
     `;
     previewEl.classList.remove('hidden');
     previewEl.textContent = JSON.stringify({ url: lc.url, title: lc.title, ax_tree: lc.ax_tree?.slice(0, 6), redacted_regions: lc.redacted_regions, hasScreenshot: !!lc.screenshot_redacted_b64 }, null, 2);
-    btnExecute.disabled = false;
+    // Execute stays disabled: a restored context has no action yet. Enabling it here left a
+    // live-looking button whose handler returned immediately because lastAction was null.
+    btnExecute.disabled = true;
+    confirmRow.classList.add('hidden');
   }
 })();
 
@@ -461,7 +474,7 @@ $('#viewLast')?.addEventListener('click', async (e: Event) => {
       return;
     }
     try {
-      await chrome.tabs.sendMessage(tab.id, { type: 'PING' });
+      await sendMessage('ping', undefined, tab.id);
     } catch {
       toast('Reload page once after install to inject content script');
     }

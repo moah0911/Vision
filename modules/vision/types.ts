@@ -1,8 +1,11 @@
+import type { RegionType } from '../pii/redactor';
+
 export interface AxNode {
   role: string;
   name: string;
   tag: string;
   bbox: [number, number, number, number];
+  /** Always a placeholder when the element is a form field; never the raw value. */
   value?: string;
   inputType?: string;
   isSensitive?: boolean;
@@ -14,17 +17,24 @@ export interface SanitizedContext {
   title: string;
   viewport: { width: number; height: number };
   ax_tree: AxNode[];
-  redacted_regions: Array<{ bbox: [number, number, number, number]; type: string; confidence: number }>;
+  redacted_regions: Array<{ bbox: [number, number, number, number]; type: RegionType; confidence: number }>;
   screenshot_redacted_b64?: string; // data URL jpeg, already masked
   redaction_scheme: string;
   task?: string;
   timestamp: number;
-  // Metrics for evaluation panel
+  /**
+   * False when the on-device NER pass did not finish, so entity names could not be confirmed
+   * removed from node text. Consumers must not assume entity-level completeness.
+   */
+  pii_text_scan_complete?: boolean;
   metrics?: {
     extractionMs: number;
     piiDetectionMs: number;
     visionMs?: number;
-    redactionMs: number;
+    redactionMs?: number;
+    mlRegionsAdded?: number;
+    imageRegionsAdded?: number;
+    nerComplete?: boolean;
   };
 }
 
