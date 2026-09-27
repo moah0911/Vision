@@ -1,21 +1,48 @@
 {
   "page": "public/test-pii.html",
-  "description": "Synthetic ground truth for SIH metrics 2/3. Boxes are approximate viewport coords at 1280x800, header visible.",
+  "description": "Synthetic ground truth for SIH metrics 2/3. Every item declares the detector expected to find it, because the three sources are found by different layers and scoring one detector against another's items produces phantom failures.",
+  "sources": {
+    "text": "Visible page text — modules/pii/regex.ts detectRegexPii(). Scored by scripts/evaluate-full.mjs.",
+    "input": "A form control's value attribute — not visible in page text, so a text regex can never see it. Found by detectSensitiveInputs() and neutralised by the value-redaction path. Scored by scripts/e2e-leak.test.mjs (needs a DOM).",
+    "selector": "Inferred from the element's attributes, value unknown to any text scan.",
+    "ml": "Requires the on-device model (NER / yolos-tiny). Scored by the browser e2e."
+  },
   "groundTruth": [
-    { "type": "EMAIL", "value": "john.doe@example.com", "count": 2 },
-    { "type": "EMAIL", "value": "arjun.sharma@company.co.in", "count": 1 },
-    { "type": "PHONE", "value": "+91 98765 43210", "count": 2 },
-    { "type": "PHONE", "value": "99988 77766", "count": 1 },
-    { "type": "AADHAAR", "value": "1234 5678 9012", "count": 1 },
-    { "type": "PAN", "value": "ABCDE1234F", "count": 3 },
-    { "type": "CREDIT_CARD", "value": "4111 1111 1111 1111", "count": 2 },
-    { "type": "SSN", "value": "123-45-6789", "count": 1 },
-    { "type": "IP_ADDRESS", "value": "192.168.1.42", "count": 1 },
-    { "type": "PASSWORD", "value": "password input", "count": 1, "selector": "input[type=password]" },
-    { "type": "FACE", "value": "simulated face 1", "count": 1 },
-    { "type": "FACE", "value": "simulated face 2", "count": 1 }
+    { "type": "EMAIL", "value": "john.doe@example.com", "source": "text", "count": 1, "at": "line 26 paragraph" },
+    { "type": "EMAIL", "value": "john.doe@example.com", "source": "input", "count": 1, "selector": "input[type=email]", "at": "line 45 value attribute" },
+    { "type": "EMAIL", "value": "arjun.sharma@company.co.in", "source": "text", "count": 1, "at": "line 54 paragraph" },
+
+    { "type": "PHONE", "value": "+91 98765 43210", "source": "text", "count": 1, "at": "line 27 paragraph" },
+    { "type": "PHONE", "value": "+91 98765 43210", "source": "input", "count": 1, "selector": "input[type=tel]", "at": "line 47 value attribute" },
+    { "type": "PHONE", "value": "99988 77766", "source": "text", "count": 1, "at": "line 54 paragraph" },
+
+    { "type": "AADHAAR", "value": "1234 5678 9012", "source": "text", "count": 1, "at": "line 28 paragraph" },
+    { "type": "PAN", "value": "ABCDE1234F", "source": "text", "count": 2, "at": "lines 29 and 54" },
+    { "type": "CREDIT_CARD", "value": "4111 1111 1111 1111", "source": "text", "count": 1, "at": "line 35 paragraph" },
+    { "type": "CREDIT_CARD", "value": "4111 1111 1111 1111", "source": "input", "count": 1, "selector": "input[autocomplete*=cc-]", "at": "line 39 value attribute" },
+    { "type": "SSN", "value": "123-45-6789", "source": "text", "count": 1, "at": "line 36 paragraph" },
+    { "type": "IP_ADDRESS", "value": "192.168.1.42", "source": "text", "count": 1, "at": "line 37 paragraph" },
+
+    { "type": "PASSWORD", "value": "s3cr3tP@ss!", "source": "selector", "count": 1, "selector": "input[type=password]", "note": "The word 'password' in a label is NOT PII and must not be redacted; only the field's value is." },
+
+    { "type": "PERSON", "value": "John Doe", "source": "ml", "count": 1, "note": "Cardholder name in a type=text input at line 38 — the canonical raw-PII leak case. Also appears in page text at lines 25 and 54." },
+    { "type": "PERSON", "value": "Arjun Sharma", "source": "ml", "count": 1, "note": "Page text, line 54." },
+    { "type": "FACE", "value": "simulated face", "source": "ml", "count": 2, "note": "CSS gradients, lines 31." }
   ],
-  "totalSpans": 16,
-  "sensitiveInputs": 4,
-  "notes": "Evaluate via scripts/evaluate.mjs and server POST /api/evaluate/redaction with IoU>=0.5 for bbox precision. Text PII uses regex; NER adds PER/LOC. Person/phone boxes via yolos-tiny on screenshot."
+
+  "totals": {
+    "text": 8,
+    "input": 3,
+    "selector": 1,
+    "ml": 4,
+    "sensitiveInputs": 4,
+    "note": "sensitiveInputs = email, password, tel, cc-number (the four controls whose values must never leave the device)."
+  },
+
+  "excluded": {
+    "block": "pre#groundTruth",
+    "reason": "The page prints its own answer key. Scanning it inflates apparent recall — it was previously counted as detections, roughly a third of the total."
+  },
+
+  "notes": "Metric 2 text recall: node scripts/evaluate-full.mjs. Metric 2 input/selector/ML + raw-PII leak assertions: node scripts/e2e-leak.test.mjs (headless Chrome). Metric 3 bbox IoU: greedy 1:1 matching in modules/pii/redactor.ts and POST /api/evaluate/redaction."
 }
