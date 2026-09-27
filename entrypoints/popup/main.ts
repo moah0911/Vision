@@ -62,7 +62,7 @@ app.innerHTML = `
       <div id="toast" class="toast hidden"></div>
     </section>
 
-    <footer>ISRO SIH • Privacy-preserving vision agent • <a href="#" id="viewLast">view lastContext</a></footer>
+    <footer>On-device PII redaction • <a href="#" id="viewLast">view lastContext</a></footer>
   </div>
 `;
 

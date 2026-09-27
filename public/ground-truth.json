@@ -1,6 +1,6 @@
 {
   "page": "public/test-pii.html",
-  "description": "Synthetic ground truth for SIH metrics 2/3. Every item declares the detector expected to find it, because the three sources are found by different layers and scoring one detector against another's items produces phantom failures.",
+  "description": "Synthetic ground truth for the redaction evaluation (metrics 2/3). Every item declares the detector expected to find it, because the three sources are found by different layers and scoring one detector against another's items produces phantom failures.",
   "sources": {
     "text": "Visible page text — modules/pii/regex.ts detectRegexPii(). Scored by scripts/evaluate-full.mjs.",
     "input": "A form control's value attribute — not visible in page text, so a text regex can never see it. Found by detectSensitiveInputs() and neutralised by the value-redaction path. Scored by scripts/e2e-leak.test.mjs (needs a DOM).",

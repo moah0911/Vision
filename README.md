@@ -1,6 +1,6 @@
 # Vision Privacy Agent — On-device Visual Perception for Light-weight Browser Agents
 
-> **SIH / Final Year Project** — Privacy-preserving browser agent that runs a local Vision Transformer (via WebGPU/WASM + Transformers.js) to read screen state, dynamically redacts PII (faces/passwords/emails/phones/cards/Aadhaar/PAN), and sends **only sanitized** context to server. Server (FastAPI + VLM/heuristic) returns actionable commands (`click`/`fill`/`scroll`/`say`) that the client executes.
+> Privacy-preserving browser agent that runs a local Vision Transformer (via WebGPU/WASM + Transformers.js) to read screen state, dynamically redacts PII (faces/passwords/emails/phones/cards/Aadhaar/PAN), and sends **only sanitized** context to server. Server (FastAPI + VLM/heuristic) returns actionable commands (`click`/`fill`/`scroll`/`say`) that the client executes.
 
 ## Demo (2 min flow) — see TESTING.md for full steps
 1. `chrome://extensions` → Developer ON → Load unpacked `.output/chrome-mv3` (or `npm run dev`)
@@ -162,6 +162,3 @@ answer key, and counting those hits inflated apparent recall by roughly a third.
 - `redacted_regions` are single boxes per parent element, so two different PII values in one
   paragraph collapse to one region labelled with the higher-priority type. Per-value placeholders
   are still applied to the text, so no redaction is lost.
-
-## Mentors
-Gulshan Gupta (gulshang@sac.isro.gov.in), Navita Jayesh Thakkar (navitat@sac.isro.gov.in) — ISRO SAC
